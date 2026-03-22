@@ -18,6 +18,13 @@ const pool = new pg.Pool({
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || 'mxbai-embed-large';
 const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || 'qwen2.5:32b';
+const OLLAMA_AUTH = process.env.OLLAMA_AUTH || ''; // Base64 Basic auth for Twingate proxy
+
+function ollamaHeaders() {
+  const h = { 'Content-Type': 'application/json' };
+  if (OLLAMA_AUTH) h['Authorization'] = `Basic ${OLLAMA_AUTH}`;
+  return h;
+}
 
 // Test DB connection on startup
 pool.connect()
@@ -28,7 +35,7 @@ pool.connect()
 async function generateEmbedding(text) {
   const response = await fetch(`${OLLAMA_URL}/api/embeddings`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: ollamaHeaders(),
     body: JSON.stringify({ model: EMBED_MODEL, prompt: text }),
   });
 
@@ -55,7 +62,7 @@ JSON only, no explanation:`;
   try {
     const response = await fetch(`${OLLAMA_URL}/api/generate`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: ollamaHeaders(),
       body: JSON.stringify({
         model: CHAT_MODEL,
         prompt,
