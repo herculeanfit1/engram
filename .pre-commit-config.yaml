@@ -1,0 +1,13 @@
+repos:
+  - repo: local
+    hooks:
+      - id: biome-check
+        name: Biome check
+        entry: npx @biomejs/biome check --write
+        language: system
+        types_or: [javascript, jsx, typescript, tsx, json]
+      - id: no-dot-env
+        name: Block .env commits
+        entry: bash -c 'echo "BLOCKED: .env files cannot be committed" && exit 1'
+        language: system
+        files: '(^|/)\.env(\.local|\.bak|\.backup)?$'

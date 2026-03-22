@@ -1,4 +1,10 @@
 node_modules/
 .env
-.env.*
+.env.local
+.env.bak
+.env.backup
 !.env.example
+!.env.1p.template
+.envrc
+.mcp.json
+.DS_Store
