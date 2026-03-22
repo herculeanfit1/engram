@@ -1,0 +1,205 @@
+# Canonical CI workflow — copy to .github/workflows/standards-check.yml in each agent repo.
+# Auto-detects Node/Python/infra and runs the appropriate checks.
+# Maintained by HerculeanOlympus. Do not edit per-repo copies; update the canonical copy here.
+
+name: Standards Check
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  standards:
+    name: Standards Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # ── Detect repo type ───────────────────────────────
+      - name: Detect repo type
+        id: detect
+        run: |
+          if [ -f "package.json" ]; then
+            echo "type=node" >> "$GITHUB_OUTPUT"
+          elif [ -f "pyproject.toml" ]; then
+            echo "type=python" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=infra" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Detected repo type: $(grep type "$GITHUB_OUTPUT" | cut -d= -f2)"
+
+      # ── Universal checks (all tiers) ──────────────────
+      - name: Required files exist
+        run: |
+          FAILED=0
+          for file in STANDARDS.md CLAUDE.md .gitignore; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Missing required file: $file"
+              FAILED=1
+            fi
+          done
+          exit $FAILED
+
+      - name: No .env files in git
+        run: |
+          ENV_FILES=$(git ls-files | grep -E '(^|/)\.env(\.local|\.bak|\.backup)?$' || true)
+          if [ -n "$ENV_FILES" ]; then
+            echo "::error::CRITICAL: .env files committed to git: $ENV_FILES"
+            exit 1
+          fi
+
+      - name: No hardcoded secrets in docker-compose
+        run: |
+          COMPOSE_FILES=$(find . -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' 2>/dev/null || true)
+          if [ -n "$COMPOSE_FILES" ]; then
+            VIOLATIONS=$(grep -nE '(PASSWORD|SECRET_KEY)=' $COMPOSE_FILES | grep -vE '(\$\{|op://|changeme|REPLACE_ME)' || true)
+            if [ -n "$VIOLATIONS" ]; then
+              echo "::error::Hardcoded secrets in docker-compose: $VIOLATIONS"
+              exit 1
+            fi
+          fi
+
+      - name: Pre-commit config exists
+        run: |
+          if [ ! -f ".pre-commit-config.yaml" ]; then
+            echo "::error::Missing .pre-commit-config.yaml"
+            exit 1
+          fi
+
+      - name: Gitignore completeness
+        run: |
+          REQUIRED=("node_modules/" ".env" ".env.local" ".env.bak" ".env.backup" ".envrc" ".mcp.json" ".DS_Store")
+          MISSING=()
+          for entry in "${REQUIRED[@]}"; do
+            if ! grep -qF "$entry" .gitignore 2>/dev/null; then
+              MISSING+=("$entry")
+            fi
+          done
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "::warning::Missing .gitignore entries: ${MISSING[*]}"
+          fi
+
+      - name: 1Password template exists
+        run: |
+          if [ ! -f ".env.1p.template" ]; then
+            echo "::warning::Missing .env.1p.template"
+          else
+            OP_REFS=$(grep -c 'op://' .env.1p.template || true)
+            if [ "$OP_REFS" -eq 0 ]; then
+              echo "::warning::.env.1p.template has no op:// references"
+            fi
+          fi
+
+      - name: CLAUDE.md has required sections
+        run: |
+          for section in "Identity" "Scope" "Commands" "Standards"; do
+            if ! grep -qi "##.*${section}\|#.*${section}" CLAUDE.md 2>/dev/null; then
+              echo "::warning::CLAUDE.md missing section: $section"
+            fi
+          done
+
+      # ── Node.js checks ────────────────────────────────
+      - name: Node — linter config exists
+        if: steps.detect.outputs.type == 'node'
+        run: |
+          if [ ! -f "biome.json" ]; then
+            echo "::error::Missing biome.json"
+            exit 1
+          fi
+
+      - name: Node — package.json compliance
+        if: steps.detect.outputs.type == 'node'
+        run: |
+          FAILED=0
+          TYPE=$(node -e "console.log(require('./package.json').type || '')")
+          if [ "$TYPE" != "module" ]; then
+            echo "::error::package.json missing \"type\": \"module\""
+            FAILED=1
+          fi
+          ENGINES=$(node -e "console.log(require('./package.json').engines?.node || '')")
+          if [ -z "$ENGINES" ]; then
+            echo "::error::package.json missing engines.node"
+            FAILED=1
+          fi
+          exit $FAILED
+
+      - name: Node — op run wrapping
+        if: steps.detect.outputs.type == 'node'
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            const scripts = pkg.scripts || {};
+            const needsSecrets = Object.entries(scripts)
+              .filter(([k, v]) => v.includes('node ') && !k.match(/^(lint|format|check|biome|test|pre-commit)/))
+              .filter(([k, v]) => !v.includes('op run'))
+              .filter(([k]) => !scripts['op:' + k]);
+            if (needsSecrets.length > 0) {
+              console.log('::warning::Scripts without op run wrapping: ' + needsSecrets.map(([k]) => k).join(', '));
+            }
+          " 2>/dev/null || true
+
+      - name: Node — package-lock committed
+        if: steps.detect.outputs.type == 'node'
+        run: |
+          DEPS=$(node -e "console.log(Object.keys(require('./package.json').dependencies || {}).length)" 2>/dev/null || echo "0")
+          if [ "$DEPS" -gt 0 ]; then
+            if ! git ls-files --error-unmatch package-lock.json >/dev/null 2>&1; then
+              echo "::warning::package-lock.json not committed"
+            fi
+          fi
+
+      - name: Node — setup
+        if: steps.detect.outputs.type == 'node'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Node — run biome
+        if: steps.detect.outputs.type == 'node'
+        run: npx @biomejs/biome check .
+
+      # ── Python checks ──────────────────────────────────
+      - name: Python — linter config exists
+        if: steps.detect.outputs.type == 'python'
+        run: |
+          if [ ! -f "pyproject.toml" ]; then
+            echo "::error::Missing pyproject.toml"
+            exit 1
+          fi
+          if ! grep -q "\[tool.ruff\]" pyproject.toml 2>/dev/null; then
+            echo "::warning::pyproject.toml missing [tool.ruff] section"
+          fi
+
+      - name: Python — setup
+        if: steps.detect.outputs.type == 'python'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Python — run ruff
+        if: steps.detect.outputs.type == 'python'
+        run: |
+          pip install ruff
+          ruff check .
+          ruff format --check .
+
+      # ── Infra checks ───────────────────────────────────
+      - name: Infra — validate YAML/JSON
+        if: steps.detect.outputs.type == 'infra'
+        run: |
+          FAILED=0
+          for f in $(find . -name '*.yml' -o -name '*.yaml' | grep -v node_modules | grep -v '.override.' | head -20); do
+            python3 -c "import yaml; yaml.safe_load(open('$f'))" 2>/dev/null || {
+              echo "::error::Invalid YAML: $f"
+              FAILED=1
+            }
+          done
+          for f in $(find . -name '*.json' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/.devcontainer/*' | head -20); do
+            python3 -c "import json; json.load(open('$f'))" 2>/dev/null || {
+              echo "::error::Invalid JSON: $f"
+              FAILED=1
+            }
+          done
+          exit $FAILED
