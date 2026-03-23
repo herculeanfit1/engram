@@ -1,6 +1,6 @@
 interface AuditEvent {
   timestamp: string;
-  level: 'info' | 'warn' | 'error';
+  level: "info" | "warn" | "error";
   eventType: string;
   action: string;
   success: boolean;
@@ -11,36 +11,47 @@ interface AuditEvent {
 }
 
 class AuditLogger {
-  private serviceName = 'engram-mcp-server';
-  private serviceVersion = '1.0.0';
+  private serviceName = "engram-mcp-server";
+  private serviceVersion = "1.0.0";
 
   private log(event: AuditEvent): void {
-    const entry = { ...event, service: this.serviceName, version: this.serviceVersion };
+    const entry = {
+      ...event,
+      service: this.serviceName,
+      version: this.serviceVersion,
+    };
     const line = JSON.stringify(entry);
-    if (event.level === 'error') {
+    if (event.level === "error") {
       console.error(line);
     } else {
-      console.error(line);  // stderr to avoid polluting stdio MCP transport
+      console.error(line); // stderr to avoid polluting stdio MCP transport
     }
   }
 
   serverStart(port: number | null, details: Record<string, unknown>): void {
     this.log({
       timestamp: new Date().toISOString(),
-      level: 'info',
-      eventType: 'server',
-      action: 'startup',
+      level: "info",
+      eventType: "server",
+      action: "startup",
       success: true,
-      message: port ? `HTTP server started on port ${port}` : 'Stdio server started',
+      message: port
+        ? `HTTP server started on port ${port}`
+        : "Stdio server started",
       details,
     });
   }
 
-  toolCall(toolName: string, success: boolean, durationMs?: number, error?: string): void {
+  toolCall(
+    toolName: string,
+    success: boolean,
+    durationMs?: number,
+    error?: string,
+  ): void {
     this.log({
       timestamp: new Date().toISOString(),
-      level: success ? 'info' : 'error',
-      eventType: 'tool_call',
+      level: success ? "info" : "error",
+      eventType: "tool_call",
       action: toolName,
       success,
       durationMs,
@@ -51,9 +62,9 @@ class AuditLogger {
   accessDenied(path: string, reason: string, ip?: string): void {
     this.log({
       timestamp: new Date().toISOString(),
-      level: 'warn',
-      eventType: 'auth',
-      action: 'access_denied',
+      level: "warn",
+      eventType: "auth",
+      action: "access_denied",
       success: false,
       message: reason,
       details: { path, ip },
@@ -63,9 +74,9 @@ class AuditLogger {
   rateLimitHit(path: string, ip?: string): void {
     this.log({
       timestamp: new Date().toISOString(),
-      level: 'warn',
-      eventType: 'rate_limit',
-      action: 'blocked',
+      level: "warn",
+      eventType: "rate_limit",
+      action: "blocked",
       success: false,
       details: { path, ip },
     });

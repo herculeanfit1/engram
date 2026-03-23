@@ -14,14 +14,15 @@
  *   MEM0_USER   - mem0 user_id (default: dude)
  */
 
-const MEM0_URL = process.env.MEM0_URL || 'http://10.0.0.10:8765';
-const ENGRAM_URL = process.env.ENGRAM_URL || 'http://10.0.0.10:3700';
-const MEM0_USER = process.env.MEM0_USER || 'dude';
-const DRY_RUN = process.argv.includes('--dry-run');
+const MEM0_URL = process.env.MEM0_URL || "http://10.0.0.10:8765";
+const ENGRAM_URL = process.env.ENGRAM_URL || "http://10.0.0.10:3700";
+const MEM0_USER = process.env.MEM0_USER || "dude";
+const DRY_RUN = process.argv.includes("--dry-run");
 
 async function fetchMem0Memories() {
   const res = await fetch(`${MEM0_URL}/api/v1/memories/?user_id=${MEM0_USER}`);
-  if (!res.ok) throw new Error(`mem0 API returned ${res.status}: ${await res.text()}`);
+  if (!res.ok)
+    throw new Error(`mem0 API returned ${res.status}: ${await res.text()}`);
   const data = await res.json();
   return data.items || [];
 }
@@ -29,12 +30,12 @@ async function fetchMem0Memories() {
 function transformMemory(mem) {
   return {
     content: mem.content,
-    source: 'mem0',
+    source: "mem0",
     metadata: {
-      source: 'mem0',
+      source: "mem0",
       mem0_id: mem.id,
       mem0_state: mem.state,
-      mem0_app: mem.app_name || 'openmemory',
+      mem0_app: mem.app_name || "openmemory",
       mem0_categories: mem.categories || [],
       mem0_created_at: mem.created_at
         ? new Date(mem.created_at * 1000).toISOString()
@@ -48,8 +49,8 @@ function transformMemory(mem) {
 
 async function captureThought(thought) {
   const res = await fetch(`${ENGRAM_URL}/capture`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(thought),
   });
   if (!res.ok) {
@@ -60,28 +61,28 @@ async function captureThought(thought) {
 }
 
 async function main() {
-  console.log('=== mem0 → Engram Migration ===');
+  console.log("=== mem0 → Engram Migration ===");
   console.log(`mem0:   ${MEM0_URL} (user: ${MEM0_USER})`);
   console.log(`Engram: ${ENGRAM_URL}`);
-  if (DRY_RUN) console.log('*** DRY RUN — no writes ***');
+  if (DRY_RUN) console.log("*** DRY RUN — no writes ***");
   console.log();
 
   // 1. Export mem0 memories
-  console.log('Fetching mem0 memories...');
+  console.log("Fetching mem0 memories...");
   const memories = await fetchMem0Memories();
-  const active = memories.filter(m => m.state === 'active');
+  const active = memories.filter((m) => m.state === "active");
   console.log(`Found ${memories.length} total, ${active.length} active\n`);
 
   if (active.length === 0) {
-    console.log('Nothing to migrate.');
+    console.log("Nothing to migrate.");
     return;
   }
 
   // 2. Check Engram health
   const healthRes = await fetch(`${ENGRAM_URL}/health`);
   const health = await healthRes.json();
-  if (health.status !== 'ok') {
-    console.error('Engram is not healthy:', health);
+  if (health.status !== "ok") {
+    console.error("Engram is not healthy:", health);
     process.exit(1);
   }
   console.log(`Engram health: ${health.status}, DB: ${health.database}\n`);
@@ -110,7 +111,7 @@ async function main() {
 
     try {
       const t0 = Date.now();
-      const result = await captureThought(thought);
+      const _result = await captureThought(thought);
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       console.log(`${progress} OK (${elapsed}s): ${preview}`);
       succeeded++;
@@ -128,7 +129,9 @@ async function main() {
   console.log();
   if (!DRY_RUN) {
     const postStats = await (await fetch(`${ENGRAM_URL}/stats`)).json();
-    console.log(`Post-migration: ${postStats.total_thoughts} thoughts in Engram`);
+    console.log(
+      `Post-migration: ${postStats.total_thoughts} thoughts in Engram`,
+    );
   }
 
   console.log(`\n=== Migration Complete ===`);
@@ -137,7 +140,7 @@ async function main() {
   console.log(`Time:      ${totalTime}s`);
 
   if (errors.length > 0) {
-    console.log('\nFailed items:');
+    console.log("\nFailed items:");
     for (const e of errors) {
       console.log(`  ${e.index}: ${e.content} — ${e.error}`);
     }
@@ -146,7 +149,7 @@ async function main() {
   if (failed > 0) process.exit(1);
 }
 
-main().catch(err => {
-  console.error('Fatal error:', err);
+main().catch((err) => {
+  console.error("Fatal error:", err);
   process.exit(1);
 });

@@ -1,4 +1,4 @@
-import { getConfig } from './config.js';
+import { getConfig } from "./config.js";
 
 export interface ThoughtResult {
   id: string;
@@ -31,7 +31,10 @@ export interface HealthResult {
   database: string;
 }
 
-async function engramFetch(path: string, options?: RequestInit): Promise<Response> {
+async function engramFetch(
+  path: string,
+  options?: RequestInit,
+): Promise<Response> {
   const { engramUrl } = getConfig();
   const url = `${engramUrl}${path}`;
   const res = await fetch(url, options);
@@ -53,7 +56,11 @@ export async function search(
     threshold: String(threshold),
   });
   const res = await engramFetch(`/search?${params}`);
-  return res.json() as Promise<{ query: string; count: number; results: ThoughtResult[] }>;
+  return res.json() as Promise<{
+    query: string;
+    count: number;
+    results: ThoughtResult[];
+  }>;
 }
 
 export async function capture(
@@ -65,20 +72,20 @@ export async function capture(
   if (source) body.source = source;
   if (metadata) body.metadata = metadata;
 
-  const res = await engramFetch('/capture', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+  const res = await engramFetch("/capture", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   return res.json() as Promise<CaptureResult>;
 }
 
 export async function stats(): Promise<StatsResult> {
-  const res = await engramFetch('/stats');
+  const res = await engramFetch("/stats");
   return res.json() as Promise<StatsResult>;
 }
 
 export async function health(): Promise<HealthResult> {
-  const res = await engramFetch('/health');
+  const res = await engramFetch("/health");
   return res.json() as Promise<HealthResult>;
 }
