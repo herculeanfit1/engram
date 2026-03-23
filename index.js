@@ -7,7 +7,7 @@ app.use(express.json({ limit: "1mb" }));
 // PostgreSQL connection
 const pool = new pg.Pool({
   host: process.env.DB_HOST || "localhost",
-  port: parseInt(process.env.DB_PORT || "5432"),
+  port: parseInt(process.env.DB_PORT || "5432", 10),
   database: process.env.DB_NAME || "engram",
   user: process.env.DB_USER || "engram",
   password: process.env.DB_PASSWORD,
@@ -22,7 +22,7 @@ const OLLAMA_AUTH = process.env.OLLAMA_AUTH || ""; // Base64 Basic auth for Twin
 
 function ollamaHeaders() {
   const h = { "Content-Type": "application/json" };
-  if (OLLAMA_AUTH) h["Authorization"] = `Basic ${OLLAMA_AUTH}`;
+  if (OLLAMA_AUTH) h.Authorization = `Basic ${OLLAMA_AUTH}`;
   return h;
 }
 
@@ -203,7 +203,7 @@ app.get("/search", async (req, res) => {
 
     const result = await pool.query(
       `SELECT * FROM match_thoughts($1::vector, $2, $3)`,
-      [`[${embedding.join(",")}]`, parseFloat(threshold), parseInt(limit)],
+      [`[${embedding.join(",")}]`, parseFloat(threshold), parseInt(limit, 10)],
     );
 
     res.json({ query: q, count: result.rows.length, results: result.rows });
@@ -214,7 +214,7 @@ app.get("/search", async (req, res) => {
 });
 
 // GET /stats
-app.get("/stats", async (req, res) => {
+app.get("/stats", async (_req, res) => {
   try {
     const result = await pool.query(`
       SELECT
@@ -233,7 +233,7 @@ app.get("/stats", async (req, res) => {
 });
 
 // GET /health
-app.get("/health", async (req, res) => {
+app.get("/health", async (_req, res) => {
   try {
     await pool.query("SELECT 1");
     res.json({
@@ -253,7 +253,7 @@ app.get("/health", async (req, res) => {
   }
 });
 
-const PORT = parseInt(process.env.PORT || "3700");
+const PORT = parseInt(process.env.PORT || "3700", 10);
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Engram API listening on port ${PORT}`);
   console.log(
