@@ -62,19 +62,14 @@ export function registerMemoryTools(server: McpServer): void {
 
           // For chunks, show chunk info and parent summary
           if (r.thought_type === "transcript_chunk") {
-            parts.push(
-              `*Chunk ${r.chunk_index}/${r.total_chunks}*`,
-            );
+            parts.push(`*Chunk ${r.chunk_index}/${r.total_chunks}*`);
             parts.push(r.content);
             if (r.parent_transcript?.summary) {
               parts.push(
                 `\n**Transcript summary:** ${r.parent_transcript.summary}`,
               );
             }
-          } else if (
-            r.thought_type === "transcript_master" &&
-            r.summary
-          ) {
+          } else if (r.thought_type === "transcript_master" && r.summary) {
             parts.push(`**Summary:** ${r.summary}`);
             parts.push(
               `*Full transcript: ${r.total_chunks} chunks, ${r.content.length} chars*`,
