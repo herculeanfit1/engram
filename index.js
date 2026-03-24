@@ -647,9 +647,7 @@ app.get("/transcript/:groupId", async (req, res) => {
     );
 
     if (master.rows.length === 0) {
-      return res
-        .status(404)
-        .json({ error: "Transcript not found" });
+      return res.status(404).json({ error: "Transcript not found" });
     }
 
     const chunks = await pool.query(

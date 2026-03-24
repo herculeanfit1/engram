@@ -47,8 +47,7 @@ export function registerMemoryTools(server: McpServer): void {
         const lines = data.results.map((r, i) => {
           const sim = (r.similarity * 100).toFixed(1);
           const meta = r.metadata;
-          const type =
-            r.thought_type || (meta?.type as string) || "unknown";
+          const type = r.thought_type || (meta?.type as string) || "unknown";
           const topics = Array.isArray(meta?.topics)
             ? (meta.topics as string[]).join(", ")
             : "";
