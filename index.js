@@ -97,7 +97,100 @@ JSON only, no explanation:`;
   }
 }
 
-// POST /capture - Capture a thought
+// --- Capture Queue: Background Worker ---
+const QUEUE_MAX_RETRIES = 5;
+const QUEUE_BASE_DELAY_MS = 5000;
+let queueWorkerRunning = false;
+
+async function processQueueItem(item) {
+  // Mark as processing
+  await pool.query(
+    `UPDATE capture_queue SET status = 'processing' WHERE id = $1`,
+    [item.id],
+  );
+
+  // Generate embedding + extract metadata (can fail if Ollama is down)
+  const [embedding, metadata] = await Promise.all([
+    generateEmbedding(item.content),
+    extractMetadata(item.content),
+  ]);
+
+  // Merge extracted metadata with any stored metadata
+  const mergedMetadata = { ...metadata, ...(item.metadata || {}) };
+  if (item.source) mergedMetadata.source = item.source;
+
+  // Insert into thoughts table
+  await pool.query(
+    `INSERT INTO thoughts (content, embedding, metadata)
+     VALUES ($1, $2::vector, $3)`,
+    [item.content, `[${embedding.join(",")}]`, mergedMetadata],
+  );
+
+  // Mark as complete
+  await pool.query(
+    `UPDATE capture_queue SET status = 'complete', processed_at = NOW() WHERE id = $1`,
+    [item.id],
+  );
+
+  console.log(`[Queue] Processed: ${item.id} (${item.content.substring(0, 60)}...)`);
+}
+
+async function processQueue() {
+  if (queueWorkerRunning) return;
+  queueWorkerRunning = true;
+
+  try {
+    while (true) {
+      const pending = await pool.query(
+        `SELECT * FROM capture_queue WHERE status = 'pending' ORDER BY created_at LIMIT 1`,
+      );
+
+      if (pending.rows.length === 0) break;
+
+      const item = pending.rows[0];
+
+      try {
+        await processQueueItem(item);
+      } catch (err) {
+        const retryCount = item.retry_count + 1;
+        const errorMsg =
+          err instanceof Error ? err.message : "Unknown error";
+
+        if (retryCount >= QUEUE_MAX_RETRIES) {
+          await pool.query(
+            `UPDATE capture_queue SET status = 'failed', last_error = $1, retry_count = $2 WHERE id = $3`,
+            [errorMsg, retryCount, item.id],
+          );
+          console.error(
+            `[Queue] Failed permanently after ${retryCount} retries: ${item.id} — ${errorMsg}`,
+          );
+        } else {
+          await pool.query(
+            `UPDATE capture_queue SET status = 'pending', last_error = $1, retry_count = $2 WHERE id = $3`,
+            [errorMsg, retryCount, item.id],
+          );
+          console.warn(
+            `[Queue] Retry ${retryCount}/${QUEUE_MAX_RETRIES} for ${item.id} — ${errorMsg}`,
+          );
+          // Exponential backoff before next attempt
+          const delay = QUEUE_BASE_DELAY_MS * Math.pow(2, retryCount - 1);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+  } finally {
+    queueWorkerRunning = false;
+  }
+}
+
+// Poll for pending items every 10 seconds
+setInterval(() => {
+  processQueue().catch((err) =>
+    console.error("[Queue] Worker error:", err.message),
+  );
+}, 10_000);
+
+// POST /capture - Queue a thought for async processing
 app.post("/capture", async (req, res) => {
   try {
     const { content, metadata: extraMetadata, source } = req.body;
@@ -106,35 +199,29 @@ app.post("/capture", async (req, res) => {
       return res.status(400).json({ error: "Content required" });
     }
 
-    console.log(`Capturing thought (${content.length} chars)...`);
-
-    const startTime = Date.now();
-    const [embedding, metadata] = await Promise.all([
-      generateEmbedding(content),
-      extractMetadata(content),
-    ]);
-    const processingTime = Date.now() - startTime;
-
-    // Merge extracted metadata with any extra metadata provided
-    const mergedMetadata = { ...metadata, ...extraMetadata };
-    if (source) mergedMetadata.source = source;
-
+    // Persist to queue immediately — data is safe even if Ollama is down
     const result = await pool.query(
-      `INSERT INTO thoughts (content, embedding, metadata)
-       VALUES ($1, $2::vector, $3)
+      `INSERT INTO capture_queue (content, source, metadata)
+       VALUES ($1, $2, $3)
        RETURNING id, created_at`,
-      [content, `[${embedding.join(",")}]`, mergedMetadata],
+      [content, source || null, extraMetadata || null],
     );
 
-    console.log(`Captured in ${processingTime}ms: ${result.rows[0].id}`);
+    console.log(
+      `[Queue] Enqueued: ${result.rows[0].id} (${content.length} chars)`,
+    );
 
     res.json({
-      status: "captured",
+      status: "queued",
       id: result.rows[0].id,
       created_at: result.rows[0].created_at,
-      metadata: mergedMetadata,
-      processing_time_ms: processingTime,
+      message: "Capture queued for processing",
     });
+
+    // Trigger background processing (non-blocking)
+    processQueue().catch((err) =>
+      console.error("[Queue] Processing error:", err.message),
+    );
   } catch (error) {
     console.error("Capture error:", error);
     res.status(500).json({ error: error.message });
@@ -190,6 +277,25 @@ app.post("/capture/batch", async (req, res) => {
   }
 });
 
+// GET /queue - Queue monitoring
+app.get("/queue", async (_req, res) => {
+  try {
+    const stats = await pool.query(`
+      SELECT
+        status,
+        COUNT(*)::int AS count,
+        MAX(created_at) AS latest
+      FROM capture_queue
+      GROUP BY status
+      ORDER BY status
+    `);
+    res.json({ queue_stats: stats.rows });
+  } catch (error) {
+    console.error("Queue stats error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /search - Semantic search
 app.get("/search", async (req, res) => {
   try {
@@ -236,17 +342,21 @@ app.get("/stats", async (_req, res) => {
 app.get("/health", async (_req, res) => {
   try {
     await pool.query("SELECT 1");
+    const pending = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM capture_queue WHERE status = 'pending'`,
+    );
     res.json({
       status: "ok",
       service: "engram",
-      version: "1.0.0",
+      version: "1.1.0",
       database: "connected",
+      queue_pending: pending.rows[0].count,
     });
   } catch (error) {
     res.status(500).json({
       status: "error",
       service: "engram",
-      version: "1.0.0",
+      version: "1.1.0",
       database: "disconnected",
       error: error.message,
     });

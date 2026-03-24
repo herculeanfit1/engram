@@ -102,11 +102,10 @@ export function registerMemoryTools(server: McpServer): void {
         audit.toolCall("engram_capture", true, elapsed);
 
         const text = [
-          `Memory captured successfully.`,
+          `Memory queued for processing.`,
           `- **ID:** ${result.id}`,
-          `- **Type:** ${(result.metadata?.type as string) || "unknown"}`,
-          `- **Topics:** ${Array.isArray(result.metadata?.topics) ? (result.metadata.topics as string[]).join(", ") : "none"}`,
-          `- **Processing time:** ${result.processing_time_ms}ms`,
+          `- **Status:** ${result.status}`,
+          `- **Message:** ${result.message}`,
         ].join("\n");
 
         return { content: [{ type: "text" as const, text }] };
@@ -163,6 +162,7 @@ export function registerMemoryTools(server: McpServer): void {
           `- Status: ${data.status}`,
           `- Database: ${data.database}`,
           `- Version: ${data.version}`,
+          `- Queue pending: ${data.queue_pending ?? "n/a"}`,
         ].join("\n");
 
         return { content: [{ type: "text" as const, text }] };
