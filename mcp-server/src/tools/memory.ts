@@ -47,20 +47,45 @@ export function registerMemoryTools(server: McpServer): void {
         const lines = data.results.map((r, i) => {
           const sim = (r.similarity * 100).toFixed(1);
           const meta = r.metadata;
-          const type = (meta?.type as string) || "unknown";
+          const type =
+            r.thought_type || (meta?.type as string) || "unknown";
           const topics = Array.isArray(meta?.topics)
             ? (meta.topics as string[]).join(", ")
             : "";
           const date = r.created_at
             ? new Date(r.created_at).toLocaleDateString()
             : "";
-          return [
+
+          const parts = [
             `### ${i + 1}. [${sim}% match] ${type}${date ? ` — ${date}` : ""}`,
-            r.content,
-            topics ? `*Topics: ${topics}*` : "",
-          ]
-            .filter(Boolean)
-            .join("\n");
+          ];
+
+          // For chunks, show chunk info and parent summary
+          if (r.thought_type === "transcript_chunk") {
+            parts.push(
+              `*Chunk ${r.chunk_index}/${r.total_chunks}*`,
+            );
+            parts.push(r.content);
+            if (r.parent_transcript?.summary) {
+              parts.push(
+                `\n**Transcript summary:** ${r.parent_transcript.summary}`,
+              );
+            }
+          } else if (
+            r.thought_type === "transcript_master" &&
+            r.summary
+          ) {
+            parts.push(`**Summary:** ${r.summary}`);
+            parts.push(
+              `*Full transcript: ${r.total_chunks} chunks, ${r.content.length} chars*`,
+            );
+          } else {
+            parts.push(r.content);
+          }
+
+          if (topics) parts.push(`*Topics: ${topics}*`);
+
+          return parts.filter(Boolean).join("\n");
         });
 
         const text = `Found ${data.count} memories for "${query}":\n\n${lines.join("\n\n---\n\n")}`;
@@ -163,6 +188,7 @@ export function registerMemoryTools(server: McpServer): void {
           `- Database: ${data.database}`,
           `- Version: ${data.version}`,
           `- Queue pending: ${data.queue_pending ?? "n/a"}`,
+          `- Embed model: ${data.embed_model ?? "n/a"}`,
         ].join("\n");
 
         return { content: [{ type: "text" as const, text }] };
