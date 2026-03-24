@@ -40,9 +40,7 @@ pool
     client.release();
     console.log("PostgreSQL connected");
   })
-  .catch((err) =>
-    console.error("PostgreSQL connection failed:", err.message),
-  );
+  .catch((err) => console.error("PostgreSQL connection failed:", err.message));
 
 // Generate embedding via Ollama
 async function generateEmbedding(text) {
@@ -103,10 +101,7 @@ JSON only, no explanation:`;
     }
     return JSON.parse(jsonText);
   } catch (error) {
-    console.warn(
-      "Metadata extraction failed, using fallback:",
-      error.message,
-    );
+    console.warn("Metadata extraction failed, using fallback:", error.message);
     return { type: "unknown", topics: [], people: [], action_items: [] };
   }
 }
@@ -180,10 +175,7 @@ ${text}
 Summary:`;
 
   const controller = new AbortController();
-  const timeout = setTimeout(
-    () => controller.abort(),
-    SUMMARY_TIMEOUT_MS,
-  );
+  const timeout = setTimeout(() => controller.abort(), SUMMARY_TIMEOUT_MS);
 
   try {
     const response = await fetch(`${OLLAMA_URL}/api/generate`, {
@@ -414,8 +406,7 @@ async function processQueue() {
         await processQueueItem(item);
       } catch (err) {
         const retryCount = item.retry_count + 1;
-        const errorMsg =
-          err instanceof Error ? err.message : "Unknown error";
+        const errorMsg = err instanceof Error ? err.message : "Unknown error";
 
         if (retryCount >= QUEUE_MAX_RETRIES) {
           await pool.query(
@@ -571,26 +562,19 @@ app.get("/search", async (req, res) => {
 
     const result = await pool.query(
       `SELECT * FROM match_thoughts($1::vector, $2, $3)`,
-      [
-        `[${embedding.join(",")}]`,
-        parseFloat(threshold),
-        parseInt(limit, 10),
-      ],
+      [`[${embedding.join(",")}]`, parseFloat(threshold), parseInt(limit, 10)],
     );
 
     // Collect group_ids from chunk results to fetch parent transcripts
     const groupIds = [
       ...new Set(
         result.rows
-          .filter(
-            (r) =>
-              r.thought_type === "transcript_chunk" && r.group_id,
-          )
+          .filter((r) => r.thought_type === "transcript_chunk" && r.group_id)
           .map((r) => r.group_id),
       ),
     ];
 
-    let parentTranscripts = {};
+    const parentTranscripts = {};
     if (groupIds.length > 0) {
       const parents = await pool.query(
         `SELECT group_id, summary, total_chunks
