@@ -12,8 +12,7 @@ export interface CaptureResult {
   status: string;
   id: string;
   created_at: string;
-  metadata: Record<string, unknown>;
-  processing_time_ms: number;
+  message: string;
 }
 
 export interface StatsResult {
@@ -29,6 +28,7 @@ export interface HealthResult {
   service: string;
   version: string;
   database: string;
+  queue_pending?: number;
 }
 
 async function engramFetch(
