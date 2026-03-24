@@ -132,7 +132,9 @@ async function processQueueItem(item) {
     [item.id],
   );
 
-  console.log(`[Queue] Processed: ${item.id} (${item.content.substring(0, 60)}...)`);
+  console.log(
+    `[Queue] Processed: ${item.id} (${item.content.substring(0, 60)}...)`,
+  );
 }
 
 async function processQueue() {
@@ -153,8 +155,7 @@ async function processQueue() {
         await processQueueItem(item);
       } catch (err) {
         const retryCount = item.retry_count + 1;
-        const errorMsg =
-          err instanceof Error ? err.message : "Unknown error";
+        const errorMsg = err instanceof Error ? err.message : "Unknown error";
 
         if (retryCount >= QUEUE_MAX_RETRIES) {
           await pool.query(
@@ -173,7 +174,7 @@ async function processQueue() {
             `[Queue] Retry ${retryCount}/${QUEUE_MAX_RETRIES} for ${item.id} — ${errorMsg}`,
           );
           // Exponential backoff before next attempt
-          const delay = QUEUE_BASE_DELAY_MS * Math.pow(2, retryCount - 1);
+          const delay = QUEUE_BASE_DELAY_MS * 2 ** (retryCount - 1);
           await new Promise((resolve) => setTimeout(resolve, delay));
         }
       }
