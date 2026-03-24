@@ -1,8 +1,9 @@
+import crypto from "node:crypto";
 import express from "express";
 import pg from "pg";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 // PostgreSQL connection
 const pool = new pg.Pool({
@@ -16,9 +17,15 @@ const pool = new pg.Pool({
 
 // Ollama config
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
-const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || "mxbai-embed-large";
+const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || "bge-m3";
 const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || "qwen2.5:32b";
-const OLLAMA_AUTH = process.env.OLLAMA_AUTH || ""; // Base64 Basic auth for Twingate proxy
+const OLLAMA_AUTH = process.env.OLLAMA_AUTH || "";
+
+// Chunking config
+const LONG_CONTENT_THRESHOLD = 6000;
+const CHUNK_SIZE = 1500;
+const CHUNK_OVERLAP = 200;
+const SUMMARY_TIMEOUT_MS = 300_000;
 
 function ollamaHeaders() {
   const h = { "Content-Type": "application/json" };
@@ -44,7 +51,10 @@ async function generateEmbedding(text) {
   });
 
   if (!response.ok) {
-    throw new Error(`Ollama embeddings API returned ${response.status}`);
+    const body = await response.text();
+    throw new Error(
+      `Ollama embeddings API returned ${response.status}: ${body}`,
+    );
   }
 
   const data = await response.json();
@@ -84,7 +94,6 @@ JSON only, no explanation:`;
 
     const data = await response.json();
     let jsonText = data.response.trim();
-    // Strip markdown code fences if present
     if (jsonText.startsWith("```")) {
       jsonText = jsonText
         .replace(/^```(?:json)?\s*/, "")
@@ -95,6 +104,238 @@ JSON only, no explanation:`;
     console.warn("Metadata extraction failed, using fallback:", error.message);
     return { type: "unknown", topics: [], people: [], action_items: [] };
   }
+}
+
+// --- Chunking Utilities ---
+
+function chunkText(text, chunkSize = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
+  const chunks = [];
+  let start = 0;
+
+  while (start < text.length) {
+    let end = Math.min(start + chunkSize, text.length);
+
+    // If not the last chunk, find a sentence or whitespace boundary
+    if (end < text.length) {
+      // Look for sentence boundary (". " or "\n") within ±100 chars of target
+      const searchStart = Math.max(end - 100, start);
+      const searchEnd = Math.min(end + 100, text.length);
+      const window = text.slice(searchStart, searchEnd);
+
+      // Prefer sentence-ending boundary closest to target end
+      let bestBreak = -1;
+      const targetOffset = end - searchStart;
+      for (const pattern of [". ", ".\n", "? ", "!\n", "! ", "?\n", "\n"]) {
+        let idx = window.lastIndexOf(pattern, targetOffset + 100);
+        while (idx >= 0) {
+          const absPos = searchStart + idx + pattern.length;
+          if (absPos > start && absPos <= searchEnd) {
+            if (
+              bestBreak === -1 ||
+              Math.abs(absPos - end) < Math.abs(bestBreak - end)
+            ) {
+              bestBreak = absPos;
+            }
+          }
+          idx = window.lastIndexOf(pattern, idx - 1);
+          if (idx < 0) break;
+        }
+      }
+
+      if (bestBreak > start) {
+        end = bestBreak;
+      } else {
+        // Fall back to nearest whitespace
+        const wsIdx = text.lastIndexOf(" ", end);
+        if (wsIdx > start) end = wsIdx + 1;
+      }
+    }
+
+    chunks.push({
+      text: text.slice(start, end),
+      charStart: start,
+      charEnd: end,
+    });
+
+    // Advance by (end - overlap), but ensure forward progress
+    const nextStart = end - overlap;
+    start = nextStart > start ? nextStart : end;
+  }
+
+  return chunks;
+}
+
+// Generate summary via LLM with timeout
+async function generateSummary(text) {
+  const prompt = `You are a meeting transcript summarizer. Produce a concise summary (300-500 words) of the following transcript. Capture: key decisions made, action items with owners, major discussion topics, and any unresolved questions. Format as structured prose, not bullet lists.
+
+Transcript:
+${text}
+
+Summary:`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SUMMARY_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${OLLAMA_URL}/api/generate`, {
+      method: "POST",
+      headers: ollamaHeaders(),
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: CHAT_MODEL,
+        prompt,
+        stream: false,
+        options: { temperature: 0.3, num_predict: 1000 },
+      }),
+    });
+
+    if (!response.ok) {
+      console.warn(
+        `[Chunk] Summary LLM returned ${response.status}, skipping summary`,
+      );
+      return null;
+    }
+
+    const data = await response.json();
+    return data.response.trim();
+  } catch (error) {
+    console.warn("[Chunk] Summary generation failed:", error.message);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// --- Process Long Content (Hybrid Chunk + Summary) ---
+
+async function processLongContent(item, mergedMetadata) {
+  const t0 = Date.now();
+  const groupId = crypto.randomUUID();
+  const content = item.content;
+  const charCount = content.length;
+
+  console.log(
+    `[Chunk] Processing long content: ${charCount} chars, group ${groupId}`,
+  );
+
+  // Step A: Generate summary (non-blocking on failure)
+  const summaryT0 = Date.now();
+  const summary = await generateSummary(content);
+  const summaryMs = Date.now() - summaryT0;
+  console.log(
+    `[Chunk] Summary: ${summary ? `${summary.length} chars` : "skipped"} (${summaryMs}ms)`,
+  );
+
+  // Step B: Chunk the full text
+  const chunkT0 = Date.now();
+  const chunks = chunkText(content);
+  const totalChunks = chunks.length;
+  const chunkMs = Date.now() - chunkT0;
+  console.log(`[Chunk] Split into ${totalChunks} chunks (${chunkMs}ms)`);
+
+  // Step C: Generate embeddings
+  const embedT0 = Date.now();
+
+  // Master embedding: use summary if available, else first chunk
+  const masterEmbedText = summary || chunks[0].text;
+  const masterEmbedding = await generateEmbedding(masterEmbedText);
+
+  // Chunk embeddings (sequential to avoid overwhelming Ollama)
+  const chunkEmbeddings = [];
+  for (let i = 0; i < chunks.length; i++) {
+    try {
+      const emb = await generateEmbedding(chunks[i].text);
+      chunkEmbeddings.push(emb);
+    } catch (err) {
+      console.warn(
+        `[Chunk] Embedding failed for chunk ${i + 1}/${totalChunks}: ${err.message}`,
+      );
+      chunkEmbeddings.push(null);
+    }
+  }
+
+  const embedMs = Date.now() - embedT0;
+  const embedFailed = chunkEmbeddings.filter((e) => e === null).length;
+  console.log(
+    `[Chunk] Embeddings: ${totalChunks - embedFailed}/${totalChunks} succeeded (${embedMs}ms)`,
+  );
+
+  // Step D: Extract metadata from summary or full text
+  const metadataText = summary || content.substring(0, 6000);
+  const extractedMeta = await extractMetadata(metadataText);
+  const masterMeta = {
+    ...extractedMeta,
+    ...mergedMetadata,
+    char_count: charCount,
+    chunk_size: CHUNK_SIZE,
+    overlap: CHUNK_OVERLAP,
+    model_embedding: EMBED_MODEL,
+    model_summary: CHAT_MODEL,
+  };
+
+  // Step E: Store in database
+  const dbT0 = Date.now();
+
+  // Master thought — stores full transcript + summary
+  await pool.query(
+    `INSERT INTO thoughts
+       (content, embedding, metadata, group_id, thought_type, total_chunks, summary)
+     VALUES ($1, $2::vector, $3, $4, 'transcript_master', $5, $6)`,
+    [
+      content,
+      `[${masterEmbedding.join(",")}]`,
+      masterMeta,
+      groupId,
+      totalChunks,
+      summary,
+    ],
+  );
+
+  // Chunk thoughts
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const emb = chunkEmbeddings[i];
+    const chunkMeta = {
+      ...mergedMetadata,
+      char_start: chunk.charStart,
+      char_end: chunk.charEnd,
+      parent_group_id: groupId,
+    };
+
+    if (emb) {
+      await pool.query(
+        `INSERT INTO thoughts
+           (content, embedding, metadata, group_id, thought_type, chunk_index, total_chunks)
+         VALUES ($1, $2::vector, $3, $4, 'transcript_chunk', $5, $6)`,
+        [
+          chunk.text,
+          `[${emb.join(",")}]`,
+          chunkMeta,
+          groupId,
+          i + 1,
+          totalChunks,
+        ],
+      );
+    } else {
+      // Store without embedding — still searchable by metadata
+      await pool.query(
+        `INSERT INTO thoughts
+           (content, metadata, group_id, thought_type, chunk_index, total_chunks)
+         VALUES ($1, $2, $3, 'transcript_chunk', $4, $5)`,
+        [chunk.text, chunkMeta, groupId, i + 1, totalChunks],
+      );
+    }
+  }
+
+  const dbMs = Date.now() - dbT0;
+  const totalMs = Date.now() - t0;
+
+  console.log(
+    `[Chunk] Stored: 1 master + ${totalChunks} chunks, group ${groupId} (db: ${dbMs}ms, total: ${totalMs}ms)`,
+  );
+
+  return { groupId, totalChunks, summaryGenerated: !!summary };
 }
 
 // --- Capture Queue: Background Worker ---
@@ -109,22 +350,29 @@ async function processQueueItem(item) {
     [item.id],
   );
 
-  // Generate embedding + extract metadata (can fail if Ollama is down)
-  const [embedding, metadata] = await Promise.all([
-    generateEmbedding(item.content),
-    extractMetadata(item.content),
-  ]);
+  const isLong = item.content.length > LONG_CONTENT_THRESHOLD;
 
-  // Merge extracted metadata with any stored metadata
-  const mergedMetadata = { ...metadata, ...(item.metadata || {}) };
-  if (item.source) mergedMetadata.source = item.source;
+  if (isLong) {
+    // Hybrid chunk + summary pipeline
+    const mergedMetadata = { ...(item.metadata || {}) };
+    if (item.source) mergedMetadata.source = item.source;
+    await processLongContent(item, mergedMetadata);
+  } else {
+    // Short content — single thought, single embedding
+    const [embedding, metadata] = await Promise.all([
+      generateEmbedding(item.content),
+      extractMetadata(item.content),
+    ]);
 
-  // Insert into thoughts table
-  await pool.query(
-    `INSERT INTO thoughts (content, embedding, metadata)
-     VALUES ($1, $2::vector, $3)`,
-    [item.content, `[${embedding.join(",")}]`, mergedMetadata],
-  );
+    const mergedMetadata = { ...metadata, ...(item.metadata || {}) };
+    if (item.source) mergedMetadata.source = item.source;
+
+    await pool.query(
+      `INSERT INTO thoughts (content, embedding, metadata)
+       VALUES ($1, $2::vector, $3)`,
+      [item.content, `[${embedding.join(",")}]`, mergedMetadata],
+    );
+  }
 
   // Mark as complete
   await pool.query(
@@ -132,8 +380,9 @@ async function processQueueItem(item) {
     [item.id],
   );
 
+  const preview = item.content.substring(0, 60);
   console.log(
-    `[Queue] Processed: ${item.id} (${item.content.substring(0, 60)}...)`,
+    `[Queue] Processed: ${item.id} (${item.content.length} chars${isLong ? ", chunked" : ""}) ${preview}...`,
   );
 }
 
@@ -144,7 +393,9 @@ async function processQueue() {
   try {
     while (true) {
       const pending = await pool.query(
-        `SELECT * FROM capture_queue WHERE status = 'pending' ORDER BY created_at LIMIT 1`,
+        `SELECT * FROM capture_queue
+         WHERE status = 'pending'
+         ORDER BY created_at LIMIT 1`,
       );
 
       if (pending.rows.length === 0) break;
@@ -159,7 +410,9 @@ async function processQueue() {
 
         if (retryCount >= QUEUE_MAX_RETRIES) {
           await pool.query(
-            `UPDATE capture_queue SET status = 'failed', last_error = $1, retry_count = $2 WHERE id = $3`,
+            `UPDATE capture_queue
+             SET status = 'failed', last_error = $1, retry_count = $2
+             WHERE id = $3`,
             [errorMsg, retryCount, item.id],
           );
           console.error(
@@ -167,13 +420,14 @@ async function processQueue() {
           );
         } else {
           await pool.query(
-            `UPDATE capture_queue SET status = 'pending', last_error = $1, retry_count = $2 WHERE id = $3`,
+            `UPDATE capture_queue
+             SET status = 'pending', last_error = $1, retry_count = $2
+             WHERE id = $3`,
             [errorMsg, retryCount, item.id],
           );
           console.warn(
             `[Queue] Retry ${retryCount}/${QUEUE_MAX_RETRIES} for ${item.id} — ${errorMsg}`,
           );
-          // Exponential backoff before next attempt
           const delay = QUEUE_BASE_DELAY_MS * 2 ** (retryCount - 1);
           await new Promise((resolve) => setTimeout(resolve, delay));
         }
@@ -200,7 +454,6 @@ app.post("/capture", async (req, res) => {
       return res.status(400).json({ error: "Content required" });
     }
 
-    // Persist to queue immediately — data is safe even if Ollama is down
     const result = await pool.query(
       `INSERT INTO capture_queue (content, source, metadata)
        VALUES ($1, $2, $3)
@@ -219,7 +472,6 @@ app.post("/capture", async (req, res) => {
       message: "Capture queued for processing",
     });
 
-    // Trigger background processing (non-blocking)
     processQueue().catch((err) =>
       console.error("[Queue] Processing error:", err.message),
     );
@@ -297,7 +549,7 @@ app.get("/queue", async (_req, res) => {
   }
 });
 
-// GET /search - Semantic search
+// GET /search - Semantic search with parent transcript surfacing
 app.get("/search", async (req, res) => {
   try {
     const { q, limit = 10, threshold = 0.7 } = req.query;
@@ -313,9 +565,90 @@ app.get("/search", async (req, res) => {
       [`[${embedding.join(",")}]`, parseFloat(threshold), parseInt(limit, 10)],
     );
 
-    res.json({ query: q, count: result.rows.length, results: result.rows });
+    // Collect group_ids from chunk results to fetch parent transcripts
+    const groupIds = [
+      ...new Set(
+        result.rows
+          .filter((r) => r.thought_type === "transcript_chunk" && r.group_id)
+          .map((r) => r.group_id),
+      ),
+    ];
+
+    const parentTranscripts = {};
+    if (groupIds.length > 0) {
+      const parents = await pool.query(
+        `SELECT group_id, summary, total_chunks
+         FROM thoughts
+         WHERE group_id = ANY($1) AND thought_type = 'transcript_master'`,
+        [groupIds],
+      );
+      for (const p of parents.rows) {
+        parentTranscripts[p.group_id] = {
+          group_id: p.group_id,
+          summary: p.summary,
+          total_chunks: p.total_chunks,
+          full_content_available: true,
+        };
+      }
+    }
+
+    // Enrich results with parent info
+    const enrichedResults = result.rows.map((r) => {
+      if (
+        r.thought_type === "transcript_chunk" &&
+        r.group_id &&
+        parentTranscripts[r.group_id]
+      ) {
+        return {
+          ...r,
+          parent_transcript: parentTranscripts[r.group_id],
+        };
+      }
+      return r;
+    });
+
+    res.json({
+      query: q,
+      count: enrichedResults.length,
+      results: enrichedResults,
+    });
   } catch (error) {
     console.error("Search error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /transcript/:groupId - Fetch full transcript by group
+app.get("/transcript/:groupId", async (req, res) => {
+  try {
+    const { groupId } = req.params;
+
+    const master = await pool.query(
+      `SELECT id, content, summary, metadata, total_chunks, created_at
+       FROM thoughts
+       WHERE group_id = $1 AND thought_type = 'transcript_master'`,
+      [groupId],
+    );
+
+    if (master.rows.length === 0) {
+      return res.status(404).json({ error: "Transcript not found" });
+    }
+
+    const chunks = await pool.query(
+      `SELECT id, content, chunk_index, metadata, created_at
+       FROM thoughts
+       WHERE group_id = $1 AND thought_type = 'transcript_chunk'
+       ORDER BY chunk_index`,
+      [groupId],
+    );
+
+    res.json({
+      group_id: groupId,
+      master: master.rows[0],
+      chunks: chunks.rows,
+    });
+  } catch (error) {
+    console.error("Transcript fetch error:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -349,15 +682,16 @@ app.get("/health", async (_req, res) => {
     res.json({
       status: "ok",
       service: "engram",
-      version: "1.1.0",
+      version: "2.0.0",
       database: "connected",
       queue_pending: pending.rows[0].count,
+      embed_model: EMBED_MODEL,
     });
   } catch (error) {
     res.status(500).json({
       status: "error",
       service: "engram",
-      version: "1.1.0",
+      version: "2.0.0",
       database: "disconnected",
       error: error.message,
     });
@@ -372,5 +706,8 @@ app.listen(PORT, "0.0.0.0", () => {
   );
   console.log(
     `Ollama: ${OLLAMA_URL} (embed: ${EMBED_MODEL}, chat: ${CHAT_MODEL})`,
+  );
+  console.log(
+    `Chunking: threshold=${LONG_CONTENT_THRESHOLD}, size=${CHUNK_SIZE}, overlap=${CHUNK_OVERLAP}`,
   );
 });

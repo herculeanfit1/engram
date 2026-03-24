@@ -1,11 +1,24 @@
 import { getConfig } from "./config.js";
 
+export interface ParentTranscript {
+  group_id: string;
+  summary: string | null;
+  total_chunks: number;
+  full_content_available: boolean;
+}
+
 export interface ThoughtResult {
   id: string;
   content: string;
   similarity: number;
   metadata: Record<string, unknown>;
   created_at: string;
+  group_id?: string;
+  thought_type?: string;
+  chunk_index?: number;
+  total_chunks?: number;
+  summary?: string;
+  parent_transcript?: ParentTranscript;
 }
 
 export interface CaptureResult {
@@ -29,6 +42,7 @@ export interface HealthResult {
   version: string;
   database: string;
   queue_pending?: number;
+  embed_model?: string;
 }
 
 async function engramFetch(
