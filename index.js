@@ -27,6 +27,11 @@ const CHUNK_SIZE = 1500;
 const CHUNK_OVERLAP = 200;
 const SUMMARY_TIMEOUT_MS = 300_000;
 
+// Content hashing for dedup
+function contentHash(text) {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
 function ollamaHeaders() {
   const h = { "Content-Type": "application/json" };
   if (OLLAMA_AUTH) h.Authorization = `Basic ${OLLAMA_AUTH}`;
@@ -209,7 +214,7 @@ Summary:`;
 
 // --- Process Long Content (Hybrid Chunk + Summary) ---
 
-async function processLongContent(item, mergedMetadata) {
+async function processLongContent(item, mergedMetadata, hash) {
   const t0 = Date.now();
   const groupId = crypto.randomUUID();
   const content = item.content;
@@ -280,8 +285,8 @@ async function processLongContent(item, mergedMetadata) {
   // Master thought — stores full transcript + summary
   await pool.query(
     `INSERT INTO thoughts
-       (content, embedding, metadata, group_id, thought_type, total_chunks, summary)
-     VALUES ($1, $2::vector, $3, $4, 'transcript_master', $5, $6)`,
+       (content, embedding, metadata, group_id, thought_type, total_chunks, summary, content_hash)
+     VALUES ($1, $2::vector, $3, $4, 'transcript_master', $5, $6, $7)`,
     [
       content,
       `[${masterEmbedding.join(",")}]`,
@@ -289,6 +294,7 @@ async function processLongContent(item, mergedMetadata) {
       groupId,
       totalChunks,
       summary,
+      hash,
     ],
   );
 
@@ -351,12 +357,13 @@ async function processQueueItem(item) {
   );
 
   const isLong = item.content.length > LONG_CONTENT_THRESHOLD;
+  const hash = item.content_hash || contentHash(item.content);
 
   if (isLong) {
     // Hybrid chunk + summary pipeline
     const mergedMetadata = { ...(item.metadata || {}) };
     if (item.source) mergedMetadata.source = item.source;
-    await processLongContent(item, mergedMetadata);
+    await processLongContent(item, mergedMetadata, hash);
   } else {
     // Short content — single thought, single embedding
     const [embedding, metadata] = await Promise.all([
@@ -368,9 +375,9 @@ async function processQueueItem(item) {
     if (item.source) mergedMetadata.source = item.source;
 
     await pool.query(
-      `INSERT INTO thoughts (content, embedding, metadata)
-       VALUES ($1, $2::vector, $3)`,
-      [item.content, `[${embedding.join(",")}]`, mergedMetadata],
+      `INSERT INTO thoughts (content, embedding, metadata, content_hash)
+       VALUES ($1, $2::vector, $3, $4)`,
+      [item.content, `[${embedding.join(",")}]`, mergedMetadata, hash],
     );
   }
 
@@ -454,11 +461,57 @@ app.post("/capture", async (req, res) => {
       return res.status(400).json({ error: "Content required" });
     }
 
+    const hash = contentHash(content);
+
+    // Dedup check: look for matching hash in processed thoughts or pending queue
+    const [existingThought, existingQueue] = await Promise.all([
+      pool.query(
+        `SELECT id, group_id, created_at FROM thoughts
+         WHERE content_hash = $1 AND thought_type = 'transcript_master'
+         LIMIT 1`,
+        [hash],
+      ),
+      pool.query(
+        `SELECT id, created_at, status FROM capture_queue
+         WHERE content_hash = $1 AND status IN ('pending', 'processing')
+         LIMIT 1`,
+        [hash],
+      ),
+    ]);
+
+    if (existingThought.rows.length > 0) {
+      const existing = existingThought.rows[0];
+      console.log(
+        `[Dedup] Duplicate detected (thought ${existing.id}), hash ${hash.substring(0, 12)}`,
+      );
+      return res.status(409).json({
+        status: "duplicate",
+        message: "Content already exists",
+        existing_id: existing.id,
+        group_id: existing.group_id,
+        created_at: existing.created_at,
+      });
+    }
+
+    if (existingQueue.rows.length > 0) {
+      const existing = existingQueue.rows[0];
+      console.log(
+        `[Dedup] Duplicate detected (queued ${existing.id}), hash ${hash.substring(0, 12)}`,
+      );
+      return res.status(409).json({
+        status: "duplicate",
+        message: "Content already queued for processing",
+        queued_id: existing.id,
+        queue_status: existing.status,
+        created_at: existing.created_at,
+      });
+    }
+
     const result = await pool.query(
-      `INSERT INTO capture_queue (content, source, metadata)
-       VALUES ($1, $2, $3)
+      `INSERT INTO capture_queue (content, source, metadata, content_hash)
+       VALUES ($1, $2, $3, $4)
        RETURNING id, created_at`,
-      [content, source || null, extraMetadata || null],
+      [content, source || null, extraMetadata || null, hash],
     );
 
     console.log(
