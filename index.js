@@ -32,6 +32,10 @@ function contentHash(text) {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
 
+// UUID validation
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function ollamaHeaders() {
   const h = { "Content-Type": "application/json" };
   if (OLLAMA_AUTH) h.Authorization = `Basic ${OLLAMA_AUTH}`;
@@ -605,7 +609,7 @@ app.get("/queue", async (_req, res) => {
 // GET /search - Semantic search with parent transcript surfacing
 app.get("/search", async (req, res) => {
   try {
-    const { q, limit = 10, threshold = 0.7, filter } = req.query;
+    const { q, limit = 10, threshold = 0.7, filter, type } = req.query;
 
     if (!q) {
       return res.status(400).json({ error: 'Query parameter "q" required' });
@@ -629,22 +633,42 @@ app.get("/search", async (req, res) => {
       }
     }
 
+    // thought_type filter: equality via SQL, negation (! prefix) via post-filter
+    let filterType = type || null;
+    let excludeType = null;
+    if (filterType && filterType.startsWith("!")) {
+      excludeType = filterType.slice(1);
+      filterType = null;
+    }
+
+    const fetchLimit = excludeType
+      ? parseInt(limit, 10) * 3
+      : parseInt(limit, 10);
+
     const embedding = await generateEmbedding(q);
 
     const result = await pool.query(
-      `SELECT * FROM match_thoughts($1::vector, $2, $3, $4::jsonb)`,
+      `SELECT * FROM match_thoughts($1::vector, $2, $3, $4::jsonb, $5)`,
       [
         `[${embedding.join(",")}]`,
         parseFloat(threshold),
-        parseInt(limit, 10),
+        fetchLimit,
         JSON.stringify(parsedFilter),
+        filterType,
       ],
     );
+
+    let rows = result.rows;
+    if (excludeType) {
+      rows = rows
+        .filter((r) => r.thought_type !== excludeType)
+        .slice(0, parseInt(limit, 10));
+    }
 
     // Collect group_ids from chunk results to fetch parent transcripts
     const groupIds = [
       ...new Set(
-        result.rows
+        rows
           .filter((r) => r.thought_type === "transcript_chunk" && r.group_id)
           .map((r) => r.group_id),
       ),
@@ -669,7 +693,7 @@ app.get("/search", async (req, res) => {
     }
 
     // Enrich results with parent info
-    const enrichedResults = result.rows.map((r) => {
+    const enrichedResults = rows.map((r) => {
       if (
         r.thought_type === "transcript_chunk" &&
         r.group_id &&
@@ -702,7 +726,8 @@ app.get("/transcript/:groupId", async (req, res) => {
     const master = await pool.query(
       `SELECT id, content, summary, metadata, total_chunks, created_at
        FROM thoughts
-       WHERE group_id = $1 AND thought_type = 'transcript_master'`,
+       WHERE group_id = $1 AND thought_type = 'transcript_master'
+         AND deleted_at IS NULL`,
       [groupId],
     );
 
@@ -714,6 +739,7 @@ app.get("/transcript/:groupId", async (req, res) => {
       `SELECT id, content, chunk_index, metadata, created_at
        FROM thoughts
        WHERE group_id = $1 AND thought_type = 'transcript_chunk'
+         AND deleted_at IS NULL
        ORDER BY chunk_index`,
       [groupId],
     );
@@ -729,19 +755,151 @@ app.get("/transcript/:groupId", async (req, res) => {
   }
 });
 
+// DELETE /thoughts/:id - Soft delete a thought (cascades to chunks for masters)
+app.delete("/thoughts/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!UUID_RE.test(id))
+      return res.status(400).json({ error: "Invalid thought ID" });
+
+    const thought = await pool.query(
+      `UPDATE thoughts SET deleted_at = NOW()
+       WHERE id = $1 AND deleted_at IS NULL
+       RETURNING id, group_id, thought_type, deleted_at`,
+      [id],
+    );
+
+    if (thought.rows.length === 0) {
+      return res.status(404).json({ error: "Thought not found" });
+    }
+
+    let chunksDeleted = 0;
+    const row = thought.rows[0];
+
+    if (row.thought_type === "transcript_master" && row.group_id) {
+      const cascade = await pool.query(
+        `UPDATE thoughts SET deleted_at = NOW()
+         WHERE group_id = $1 AND thought_type = 'transcript_chunk' AND deleted_at IS NULL`,
+        [row.group_id],
+      );
+      chunksDeleted = cascade.rowCount;
+    }
+
+    res.json({
+      status: "deleted",
+      id: row.id,
+      deleted_at: row.deleted_at,
+      chunks_deleted: chunksDeleted,
+    });
+  } catch (error) {
+    console.error("Delete error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PATCH /thoughts/:id - Update metadata (merge with existing)
+app.patch("/thoughts/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!UUID_RE.test(id))
+      return res.status(400).json({ error: "Invalid thought ID" });
+
+    const { metadata } = req.body;
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+      return res.status(400).json({ error: "metadata object required" });
+    }
+
+    const result = await pool.query(
+      `UPDATE thoughts
+       SET metadata = metadata || $1::jsonb
+       WHERE id = $2 AND deleted_at IS NULL
+       RETURNING id, metadata, updated_at`,
+      [JSON.stringify(metadata), id],
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Thought not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error("Update error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /thoughts/:id/restore - Undo a soft delete (cascades to chunks for masters)
+app.post("/thoughts/:id/restore", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!UUID_RE.test(id))
+      return res.status(400).json({ error: "Invalid thought ID" });
+
+    const thought = await pool.query(
+      `UPDATE thoughts SET deleted_at = NULL
+       WHERE id = $1 AND deleted_at IS NOT NULL
+       RETURNING id, group_id, thought_type`,
+      [id],
+    );
+
+    if (thought.rows.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "Thought not found or not deleted" });
+    }
+
+    let chunksRestored = 0;
+    const row = thought.rows[0];
+
+    if (row.thought_type === "transcript_master" && row.group_id) {
+      const cascade = await pool.query(
+        `UPDATE thoughts SET deleted_at = NULL
+         WHERE group_id = $1 AND thought_type = 'transcript_chunk' AND deleted_at IS NOT NULL`,
+        [row.group_id],
+      );
+      chunksRestored = cascade.rowCount;
+    }
+
+    res.json({
+      status: "restored",
+      id: row.id,
+      chunks_restored: chunksRestored,
+    });
+  } catch (error) {
+    console.error("Restore error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /stats
 app.get("/stats", async (_req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT
-        COUNT(*) as total_thoughts,
-        COUNT(DISTINCT metadata->>'type') as unique_types,
-        COUNT(DISTINCT metadata->>'source') as unique_sources,
-        MIN(created_at) as oldest,
-        MAX(created_at) as newest
-      FROM thoughts
-    `);
-    res.json(result.rows[0]);
+    const [result, typeBreakdown] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*) as total_thoughts,
+          COUNT(DISTINCT metadata->>'type') as unique_types,
+          COUNT(DISTINCT metadata->>'source') as unique_sources,
+          MIN(created_at) as oldest,
+          MAX(created_at) as newest
+        FROM thoughts
+        WHERE deleted_at IS NULL
+      `),
+      pool.query(`
+        SELECT thought_type, COUNT(*)::int as count
+        FROM thoughts
+        WHERE deleted_at IS NULL
+        GROUP BY thought_type
+        ORDER BY count DESC
+      `),
+    ]);
+
+    const typeCounts = {};
+    for (const row of typeBreakdown.rows) {
+      typeCounts[row.thought_type] = row.count;
+    }
+
+    res.json({ ...result.rows[0], type_counts: typeCounts });
   } catch (error) {
     console.error("Stats error:", error);
     res.status(500).json({ error: error.message });

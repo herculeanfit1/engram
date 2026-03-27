@@ -31,11 +31,17 @@ export function registerMemoryTools(server: McpServer): void {
         .describe(
           'JSONB metadata filter (e.g. {"type": "decision"}, {"people": ["Alice"]})',
         ),
+      type: z
+        .string()
+        .optional()
+        .describe(
+          "Filter by thought_type (e.g. 'thought', 'transcript_master'). Prefix with ! to exclude (e.g. '!transcript_chunk')",
+        ),
     },
-    async ({ query, limit, threshold, filter }) => {
+    async ({ query, limit, threshold, filter, type }) => {
       const t0 = Date.now();
       try {
-        const data = await engram.search(query, limit, threshold, filter);
+        const data = await engram.search(query, limit, threshold, filter, type);
         const elapsed = Date.now() - t0;
         audit.toolCall("engram_search", true, elapsed);
 
