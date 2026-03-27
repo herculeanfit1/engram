@@ -605,17 +605,40 @@ app.get("/queue", async (_req, res) => {
 // GET /search - Semantic search with parent transcript surfacing
 app.get("/search", async (req, res) => {
   try {
-    const { q, limit = 10, threshold = 0.7 } = req.query;
+    const { q, limit = 10, threshold = 0.7, filter } = req.query;
 
     if (!q) {
       return res.status(400).json({ error: 'Query parameter "q" required' });
     }
 
+    let parsedFilter = {};
+    if (filter) {
+      try {
+        parsedFilter = JSON.parse(filter);
+        if (
+          typeof parsedFilter !== "object" ||
+          parsedFilter === null ||
+          Array.isArray(parsedFilter)
+        ) {
+          return res
+            .status(400)
+            .json({ error: "filter must be a JSON object" });
+        }
+      } catch {
+        return res.status(400).json({ error: "Invalid JSON in filter" });
+      }
+    }
+
     const embedding = await generateEmbedding(q);
 
     const result = await pool.query(
-      `SELECT * FROM match_thoughts($1::vector, $2, $3)`,
-      [`[${embedding.join(",")}]`, parseFloat(threshold), parseInt(limit, 10)],
+      `SELECT * FROM match_thoughts($1::vector, $2, $3, $4::jsonb)`,
+      [
+        `[${embedding.join(",")}]`,
+        parseFloat(threshold),
+        parseInt(limit, 10),
+        JSON.stringify(parsedFilter),
+      ],
     );
 
     // Collect group_ids from chunk results to fetch parent transcripts

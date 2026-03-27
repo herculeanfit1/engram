@@ -25,11 +25,17 @@ export function registerMemoryTools(server: McpServer): void {
         .describe(
           "Similarity threshold (0.3 recommended, lower = more results)",
         ),
+      filter: z
+        .record(z.unknown())
+        .optional()
+        .describe(
+          'JSONB metadata filter (e.g. {"type": "decision"}, {"people": ["Alice"]})',
+        ),
     },
-    async ({ query, limit, threshold }) => {
+    async ({ query, limit, threshold, filter }) => {
       const t0 = Date.now();
       try {
-        const data = await engram.search(query, limit, threshold);
+        const data = await engram.search(query, limit, threshold, filter);
         const elapsed = Date.now() - t0;
         audit.toolCall("engram_search", true, elapsed);
 
