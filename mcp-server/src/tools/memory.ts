@@ -49,8 +49,23 @@ export function registerMemoryTools(server: McpServer): void {
         .describe(
           "ISO 8601 date — only return thoughts created before this date",
         ),
+      cursor: z
+        .string()
+        .optional()
+        .describe(
+          "Pagination cursor from a previous search response's next_cursor field",
+        ),
     },
-    async ({ query, limit, threshold, filter, type, after, before }) => {
+    async ({
+      query,
+      limit,
+      threshold,
+      filter,
+      type,
+      after,
+      before,
+      cursor,
+    }) => {
       const t0 = Date.now();
       try {
         const data = await engram.search(
@@ -61,6 +76,7 @@ export function registerMemoryTools(server: McpServer): void {
           type,
           after,
           before,
+          cursor,
         );
         const elapsed = Date.now() - t0;
         audit.toolCall("engram_search", true, elapsed);
@@ -114,7 +130,10 @@ export function registerMemoryTools(server: McpServer): void {
           return parts.filter(Boolean).join("\n");
         });
 
-        const text = `Found ${data.count} memories for "${query}":\n\n${lines.join("\n\n---\n\n")}`;
+        let text = `Found ${data.count} memories for "${query}":\n\n${lines.join("\n\n---\n\n")}`;
+        if (data.next_cursor) {
+          text += `\n\n---\n*More results available. Use cursor: \`${data.next_cursor}\`*`;
+        }
         return { content: [{ type: "text" as const, text }] };
       } catch (error) {
         audit.toolCall("engram_search", false, Date.now() - t0, String(error));

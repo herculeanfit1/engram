@@ -617,6 +617,7 @@ app.get("/search", async (req, res) => {
       type,
       after,
       before,
+      cursor,
     } = req.query;
 
     if (!q) {
@@ -659,6 +660,25 @@ app.get("/search", async (req, res) => {
       return res.status(400).json({ error: "Invalid date in before" });
     }
 
+    // Cursor parsing
+    let cursorDistance = null;
+    let cursorId = null;
+    if (cursor) {
+      const colonIdx = cursor.indexOf(":");
+      if (colonIdx === -1) {
+        return res
+          .status(400)
+          .json({ error: "Invalid cursor format (expected distance:uuid)" });
+      }
+      cursorDistance = parseFloat(cursor.slice(0, colonIdx));
+      cursorId = cursor.slice(colonIdx + 1);
+      if (Number.isNaN(cursorDistance) || !UUID_RE.test(cursorId)) {
+        return res
+          .status(400)
+          .json({ error: "Invalid cursor format (expected distance:uuid)" });
+      }
+    }
+
     const fetchLimit = excludeType
       ? parseInt(limit, 10) * 3
       : parseInt(limit, 10);
@@ -666,7 +686,7 @@ app.get("/search", async (req, res) => {
     const embedding = await generateEmbedding(q);
 
     const result = await pool.query(
-      `SELECT * FROM match_thoughts($1::vector, $2, $3, $4::jsonb, $5, $6::timestamptz, $7::timestamptz)`,
+      `SELECT * FROM match_thoughts($1::vector, $2, $3, $4::jsonb, $5, $6::timestamptz, $7::timestamptz, $8, $9)`,
       [
         `[${embedding.join(",")}]`,
         parseFloat(threshold),
@@ -675,6 +695,8 @@ app.get("/search", async (req, res) => {
         filterType,
         afterDate ? afterDate.toISOString() : null,
         beforeDate ? beforeDate.toISOString() : null,
+        cursorDistance,
+        cursorId,
       ],
     );
 
@@ -727,10 +749,20 @@ app.get("/search", async (req, res) => {
       return r;
     });
 
+    // Build next_cursor from last result when page is full
+    const requestedLimit = parseInt(limit, 10);
+    let nextCursor = null;
+    if (enrichedResults.length === requestedLimit) {
+      const lastRow = enrichedResults[enrichedResults.length - 1];
+      const distance = parseFloat((1 - lastRow.similarity).toFixed(10));
+      nextCursor = `${distance}:${lastRow.id}`;
+    }
+
     res.json({
       query: q,
       count: enrichedResults.length,
       results: enrichedResults,
+      next_cursor: nextCursor,
     });
   } catch (error) {
     console.error("Search error:", error);
