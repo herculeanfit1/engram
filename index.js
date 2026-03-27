@@ -43,6 +43,7 @@ async function generateEmbedding(text) {
     method: "POST",
     headers: ollamaHeaders(),
     body: JSON.stringify({ model: EMBED_MODEL, prompt: text }),
+    signal: AbortSignal.timeout(60_000),
   });
 
   if (!response.ok) {

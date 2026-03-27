@@ -29,6 +29,8 @@ const LONG_CONTENT_THRESHOLD = 6000;
 const CHUNK_SIZE = 1500;
 const CHUNK_OVERLAP = 200;
 const SUMMARY_TIMEOUT_MS = 300_000;
+const EMBED_TIMEOUT_MS = 60_000;
+const METADATA_TIMEOUT_MS = 60_000;
 const QUEUE_MAX_RETRIES = 5;
 const QUEUE_BASE_DELAY_MS = 5000;
 const DISPATCH_TIMEOUT_MS = 5000;
@@ -56,6 +58,7 @@ async function generateEmbedding(text) {
     method: "POST",
     headers: ollamaHeaders(),
     body: JSON.stringify({ model: EMBED_MODEL, prompt: text }),
+    signal: AbortSignal.timeout(EMBED_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -90,6 +93,7 @@ JSON only, no explanation:`;
         stream: false,
         options: { temperature: 0.3, num_predict: 300 },
       }),
+      signal: AbortSignal.timeout(METADATA_TIMEOUT_MS),
     });
 
     if (!response.ok) {
