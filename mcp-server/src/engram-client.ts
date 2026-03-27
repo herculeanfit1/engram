@@ -67,7 +67,13 @@ export async function search(
   type?: string,
   after?: string,
   before?: string,
-): Promise<{ query: string; count: number; results: ThoughtResult[] }> {
+  cursor?: string,
+): Promise<{
+  query: string;
+  count: number;
+  results: ThoughtResult[];
+  next_cursor: string | null;
+}> {
   const params = new URLSearchParams({
     q: query,
     limit: String(limit),
@@ -85,11 +91,15 @@ export async function search(
   if (before) {
     params.set("before", before);
   }
+  if (cursor) {
+    params.set("cursor", cursor);
+  }
   const res = await engramFetch(`/search?${params}`);
   return res.json() as Promise<{
     query: string;
     count: number;
     results: ThoughtResult[];
+    next_cursor: string | null;
   }>;
 }
 
