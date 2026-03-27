@@ -63,12 +63,16 @@ export async function search(
   query: string,
   limit: number = 10,
   threshold: number = 0.3,
+  filter?: Record<string, unknown>,
 ): Promise<{ query: string; count: number; results: ThoughtResult[] }> {
   const params = new URLSearchParams({
     q: query,
     limit: String(limit),
     threshold: String(threshold),
   });
+  if (filter) {
+    params.set("filter", JSON.stringify(filter));
+  }
   const res = await engramFetch(`/search?${params}`);
   return res.json() as Promise<{
     query: string;
