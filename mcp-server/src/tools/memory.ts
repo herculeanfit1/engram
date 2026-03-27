@@ -243,4 +243,154 @@ export function registerMemoryTools(server: McpServer): void {
       }
     },
   );
+
+  // Retrieve full transcript by group ID
+  server.tool(
+    "engram_transcript",
+    "Retrieve a full transcript and all its chunks by group ID. Use this after search returns a transcript_chunk to get the complete context.",
+    {
+      group_id: z.string().uuid().describe("The group_id from a search result"),
+    },
+    async ({ group_id }) => {
+      const t0 = Date.now();
+      try {
+        const data = await engram.transcript(group_id);
+        const elapsed = Date.now() - t0;
+        audit.toolCall("engram_transcript", true, elapsed);
+
+        const parts = [`## Transcript ${group_id}\n`];
+        if (data.master.summary) {
+          parts.push(`**Summary:** ${data.master.summary}\n`);
+        }
+        parts.push(
+          `*${data.chunks.length} chunks, ${data.master.content.length} chars total*\n`,
+        );
+        for (const chunk of data.chunks) {
+          parts.push(
+            `### Chunk ${chunk.chunk_index}/${data.chunks.length}\n${chunk.content}`,
+          );
+        }
+
+        return { content: [{ type: "text" as const, text: parts.join("\n") }] };
+      } catch (error) {
+        audit.toolCall(
+          "engram_transcript",
+          false,
+          Date.now() - t0,
+          String(error),
+        );
+        return handleToolError(error);
+      }
+    },
+  );
+
+  // Queue status
+  server.tool(
+    "engram_queue",
+    "Check the status of the capture processing queue — how many items are pending, processing, complete, or failed.",
+    {},
+    async () => {
+      const t0 = Date.now();
+      try {
+        const data = await engram.queue();
+        const elapsed = Date.now() - t0;
+        audit.toolCall("engram_queue", true, elapsed);
+
+        const lines = data.queue_stats.map(
+          (s) => `- **${s.status}**: ${s.count} (latest: ${s.latest || "n/a"})`,
+        );
+        const text = `**Capture Queue**\n${lines.join("\n") || "Queue is empty."}`;
+        return { content: [{ type: "text" as const, text }] };
+      } catch (error) {
+        audit.toolCall("engram_queue", false, Date.now() - t0, String(error));
+        return handleToolError(error);
+      }
+    },
+  );
+
+  // Soft delete a thought
+  server.tool(
+    "engram_delete",
+    "Delete a thought from semantic memory. If the thought is a transcript master, all its chunks are also deleted. This is a soft delete — the data can be recovered via engram_restore.",
+    {
+      id: z.string().uuid().describe("The thought ID to delete"),
+    },
+    async ({ id }) => {
+      const t0 = Date.now();
+      try {
+        const data = await engram.deleteThought(id);
+        const elapsed = Date.now() - t0;
+        audit.toolCall("engram_delete", true, elapsed);
+
+        const text = [
+          `Thought deleted.`,
+          `- **ID:** ${data.id}`,
+          `- **Deleted at:** ${data.deleted_at}`,
+          `- **Chunks deleted:** ${data.chunks_deleted}`,
+        ].join("\n");
+        return { content: [{ type: "text" as const, text }] };
+      } catch (error) {
+        audit.toolCall("engram_delete", false, Date.now() - t0, String(error));
+        return handleToolError(error);
+      }
+    },
+  );
+
+  // Restore a soft-deleted thought
+  server.tool(
+    "engram_restore",
+    "Restore a previously deleted thought. If the thought is a transcript master, all its chunks are also restored.",
+    {
+      id: z.string().uuid().describe("The thought ID to restore"),
+    },
+    async ({ id }) => {
+      const t0 = Date.now();
+      try {
+        const data = await engram.restoreThought(id);
+        const elapsed = Date.now() - t0;
+        audit.toolCall("engram_restore", true, elapsed);
+
+        const text = [
+          `Thought restored.`,
+          `- **ID:** ${data.id}`,
+          `- **Chunks restored:** ${data.chunks_restored}`,
+        ].join("\n");
+        return { content: [{ type: "text" as const, text }] };
+      } catch (error) {
+        audit.toolCall("engram_restore", false, Date.now() - t0, String(error));
+        return handleToolError(error);
+      }
+    },
+  );
+
+  // Update thought metadata
+  server.tool(
+    "engram_update",
+    "Update metadata on an existing thought. Merges with existing metadata — unmentioned keys are preserved. Content cannot be changed (capture a new thought instead).",
+    {
+      id: z.string().uuid().describe("The thought ID to update"),
+      metadata: z
+        .record(z.unknown())
+        .describe("Metadata fields to add or overwrite"),
+    },
+    async ({ id, metadata }) => {
+      const t0 = Date.now();
+      try {
+        const data = await engram.updateThought(id, metadata);
+        const elapsed = Date.now() - t0;
+        audit.toolCall("engram_update", true, elapsed);
+
+        const text = [
+          `Thought metadata updated.`,
+          `- **ID:** ${data.id}`,
+          `- **Updated at:** ${data.updated_at}`,
+          `- **Metadata:** ${JSON.stringify(data.metadata)}`,
+        ].join("\n");
+        return { content: [{ type: "text" as const, text }] };
+      } catch (error) {
+        audit.toolCall("engram_update", false, Date.now() - t0, String(error));
+        return handleToolError(error);
+      }
+    },
+  );
 }
