@@ -609,7 +609,15 @@ app.get("/queue", async (_req, res) => {
 // GET /search - Semantic search with parent transcript surfacing
 app.get("/search", async (req, res) => {
   try {
-    const { q, limit = 10, threshold = 0.7, filter, type } = req.query;
+    const {
+      q,
+      limit = 10,
+      threshold = 0.7,
+      filter,
+      type,
+      after,
+      before,
+    } = req.query;
 
     if (!q) {
       return res.status(400).json({ error: 'Query parameter "q" required' });
@@ -636,9 +644,19 @@ app.get("/search", async (req, res) => {
     // thought_type filter: equality via SQL, negation (! prefix) via post-filter
     let filterType = type || null;
     let excludeType = null;
-    if (filterType && filterType.startsWith("!")) {
+    if (filterType?.startsWith("!")) {
       excludeType = filterType.slice(1);
       filterType = null;
+    }
+
+    // Date range validation
+    const afterDate = after ? new Date(after) : null;
+    const beforeDate = before ? new Date(before) : null;
+    if (after && Number.isNaN(afterDate.getTime())) {
+      return res.status(400).json({ error: "Invalid date in after" });
+    }
+    if (before && Number.isNaN(beforeDate.getTime())) {
+      return res.status(400).json({ error: "Invalid date in before" });
     }
 
     const fetchLimit = excludeType
@@ -648,13 +666,15 @@ app.get("/search", async (req, res) => {
     const embedding = await generateEmbedding(q);
 
     const result = await pool.query(
-      `SELECT * FROM match_thoughts($1::vector, $2, $3, $4::jsonb, $5)`,
+      `SELECT * FROM match_thoughts($1::vector, $2, $3, $4::jsonb, $5, $6::timestamptz, $7::timestamptz)`,
       [
         `[${embedding.join(",")}]`,
         parseFloat(threshold),
         fetchLimit,
         JSON.stringify(parsedFilter),
         filterType,
+        afterDate ? afterDate.toISOString() : null,
+        beforeDate ? beforeDate.toISOString() : null,
       ],
     );
 
