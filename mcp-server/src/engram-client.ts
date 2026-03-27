@@ -45,6 +45,35 @@ export interface HealthResult {
   embed_model?: string;
 }
 
+export interface TranscriptResult {
+  group_id: string;
+  master: ThoughtResult;
+  chunks: ThoughtResult[];
+}
+
+export interface QueueResult {
+  queue_stats: Array<{ status: string; count: number; latest: string }>;
+}
+
+export interface DeleteResult {
+  status: string;
+  id: string;
+  deleted_at: string;
+  chunks_deleted: number;
+}
+
+export interface RestoreResult {
+  status: string;
+  id: string;
+  chunks_restored: number;
+}
+
+export interface UpdateResult {
+  id: string;
+  metadata: Record<string, unknown>;
+  updated_at: string;
+}
+
 async function engramFetch(
   path: string,
   options?: RequestInit,
@@ -128,4 +157,36 @@ export async function stats(): Promise<StatsResult> {
 export async function health(): Promise<HealthResult> {
   const res = await engramFetch("/health");
   return res.json() as Promise<HealthResult>;
+}
+
+export async function transcript(groupId: string): Promise<TranscriptResult> {
+  const res = await engramFetch(`/transcript/${groupId}`);
+  return res.json() as Promise<TranscriptResult>;
+}
+
+export async function queue(): Promise<QueueResult> {
+  const res = await engramFetch("/queue");
+  return res.json() as Promise<QueueResult>;
+}
+
+export async function deleteThought(id: string): Promise<DeleteResult> {
+  const res = await engramFetch(`/thoughts/${id}`, { method: "DELETE" });
+  return res.json() as Promise<DeleteResult>;
+}
+
+export async function restoreThought(id: string): Promise<RestoreResult> {
+  const res = await engramFetch(`/thoughts/${id}/restore`, { method: "POST" });
+  return res.json() as Promise<RestoreResult>;
+}
+
+export async function updateThought(
+  id: string,
+  metadata: Record<string, unknown>,
+): Promise<UpdateResult> {
+  const res = await engramFetch(`/thoughts/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ metadata }),
+  });
+  return res.json() as Promise<UpdateResult>;
 }
