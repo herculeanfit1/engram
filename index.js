@@ -103,6 +103,13 @@ function spawnWorker() {
       case "error":
         console.error(`[Main] Failed: ${msg.thoughtId} — ${msg.error}`);
         break;
+      case "log":
+        if (msg.level === "error") {
+          console.error(`[Main<-Worker] ${msg.message}`);
+        } else {
+          console.log(`[Main<-Worker] ${msg.message}`);
+        }
+        break;
     }
   });
 
