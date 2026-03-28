@@ -287,10 +287,10 @@ async function processLongContent(item, mergedMetadata, hash) {
   const dbT0 = Date.now();
 
   // Master thought — stores full transcript + summary
-  await pool.query(
+  const masterInsert = await pool.query(
     `INSERT INTO thoughts
        (content, embedding, metadata, group_id, thought_type, total_chunks, summary, content_hash)
-     VALUES ($1, $2::vector, $3, $4, 'transcript_master', $5, $6, $7)`,
+     VALUES ($1, $2::vector, $3, $4, 'transcript_master', $5, $6, $7) RETURNING id`,
     [
       content,
       `[${masterEmbedding.join(",")}]`,
@@ -301,6 +301,10 @@ async function processLongContent(item, mergedMetadata, hash) {
       hash,
     ],
   );
+  const masterId = masterInsert.rows[0].id;
+
+  // Dispatch action items to DudeDash (non-blocking on failure)
+  await dispatchActionItems(masterId, masterMeta, content.substring(0, 500));
 
   // Chunk thoughts
   for (let i = 0; i < chunks.length; i++) {
@@ -348,6 +352,176 @@ async function processLongContent(item, mergedMetadata, hash) {
   return { groupId, totalChunks, summaryGenerated: !!summary };
 }
 
+// --- DudeDash Task Dispatch ---
+const DUDEDASH_URL = process.env.DUDEDASH_URL || "";
+const DUDEDASH_API_KEY = process.env.DUDEDASH_API_KEY || "";
+const DISPATCH_TIMEOUT_MS = 5000;
+const DISPATCH_MAX_RETRIES = 5;
+
+function actionItemHash(text) {
+  const normalized = text.toLowerCase().trim().replace(/\s+/g, " ");
+  return crypto.createHash("sha256").update(normalized).digest("hex");
+}
+
+async function dispatchActionItems(thoughtId, metadata, contentPreview) {
+  if (!DUDEDASH_URL || !DUDEDASH_API_KEY) return;
+  const items = metadata?.action_items;
+  if (!Array.isArray(items) || items.length === 0) return;
+
+  for (const item of items) {
+    if (typeof item !== "string" || !item.trim()) continue;
+    const hash = actionItemHash(item);
+
+    try {
+      // Dedup: insert only if hash is new
+      const ins = await pool.query(
+        `INSERT INTO task_dispatch_log (thought_id, action_item_hash, action_item_text)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (action_item_hash) DO NOTHING
+         RETURNING id`,
+        [thoughtId, hash, item],
+      );
+      if (ins.rows.length === 0) {
+        console.log(`[Dispatch] Duplicate skipped: ${item.substring(0, 60)}`);
+        continue;
+      }
+      const logId = ins.rows[0].id;
+
+      // POST to DudeDash
+      const preview = (contentPreview || "").substring(0, 500);
+      const payload = {
+        title: item,
+        description: `[Engram thought ${thoughtId}]\n\n${preview}`,
+        column: "backlog",
+        tags: Array.isArray(metadata.topics) ? metadata.topics : [],
+        assignee: ["tk"],
+        category: "personal",
+        priority: "medium",
+        source: "a2a",
+      };
+
+      const resp = await fetch(`${DUDEDASH_URL}/api/tasks`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": DUDEDASH_API_KEY,
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(DISPATCH_TIMEOUT_MS),
+      });
+
+      if (resp.ok) {
+        const task = await resp.json();
+        await pool.query(
+          `UPDATE task_dispatch_log
+           SET status = 'dispatched', dudedash_task_id = $1, dispatched_at = NOW()
+           WHERE id = $2`,
+          [task.id, logId],
+        );
+        console.log(
+          `[Dispatch] Task created: "${item.substring(0, 60)}" -> ${task.id}`,
+        );
+      } else {
+        const errBody = await resp.text().catch(() => "");
+        await pool.query(
+          `UPDATE task_dispatch_log SET status = 'failed', last_error = $1 WHERE id = $2`,
+          [`HTTP ${resp.status}: ${errBody.substring(0, 200)}`, logId],
+        );
+        console.warn(
+          `[Dispatch] Failed (${resp.status}): ${item.substring(0, 60)}`,
+        );
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : "Unknown error";
+      // Update if the row was inserted; ignore if dedup blocked it
+      await pool
+        .query(
+          `UPDATE task_dispatch_log
+           SET status = 'failed', last_error = $1
+           WHERE action_item_hash = $2 AND status = 'pending'`,
+          [errMsg.substring(0, 500), hash],
+        )
+        .catch(() => {});
+      console.warn(`[Dispatch] Error: ${errMsg} — ${item.substring(0, 60)}`);
+    }
+  }
+}
+
+// Retry failed dispatches every 60 seconds
+setInterval(async () => {
+  if (!DUDEDASH_URL || !DUDEDASH_API_KEY) return;
+  try {
+    const failed = await pool.query(
+      `SELECT id, action_item_text, thought_id, retry_count
+       FROM task_dispatch_log
+       WHERE status = 'failed' AND retry_count < $1
+         AND created_at > NOW() - INTERVAL '24 hours'
+       ORDER BY created_at LIMIT 10`,
+      [DISPATCH_MAX_RETRIES],
+    );
+    for (const row of failed.rows) {
+      try {
+        // Re-fetch thought content for description
+        const thought = await pool.query(
+          `SELECT content FROM thoughts WHERE id = $1`,
+          [row.thought_id],
+        );
+        const preview = thought.rows[0]?.content?.substring(0, 500) || "";
+
+        const resp = await fetch(`${DUDEDASH_URL}/api/tasks`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": DUDEDASH_API_KEY,
+          },
+          body: JSON.stringify({
+            title: row.action_item_text,
+            description: `[Engram thought ${row.thought_id}]\n\n${preview}`,
+            column: "backlog",
+            tags: [],
+            assignee: ["tk"],
+            category: "personal",
+            priority: "medium",
+            source: "a2a",
+          }),
+          signal: AbortSignal.timeout(DISPATCH_TIMEOUT_MS),
+        });
+
+        if (resp.ok) {
+          const task = await resp.json();
+          await pool.query(
+            `UPDATE task_dispatch_log
+             SET status = 'dispatched', dudedash_task_id = $1, dispatched_at = NOW(), retry_count = $2
+             WHERE id = $3`,
+            [task.id, row.retry_count + 1, row.id],
+          );
+          console.log(
+            `[Dispatch] Retry succeeded: "${row.action_item_text.substring(0, 60)}" -> ${task.id}`,
+          );
+        } else {
+          const errBody = await resp.text().catch(() => "");
+          await pool.query(
+            `UPDATE task_dispatch_log SET last_error = $1, retry_count = $2 WHERE id = $3`,
+            [
+              `HTTP ${resp.status}: ${errBody.substring(0, 200)}`,
+              row.retry_count + 1,
+              row.id,
+            ],
+          );
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : "Unknown error";
+        await pool.query(
+          `UPDATE task_dispatch_log SET last_error = $1, retry_count = $2 WHERE id = $3`,
+          [errMsg.substring(0, 500), row.retry_count + 1, row.id],
+        );
+      }
+    }
+  } catch (err) {
+    console.error("[Dispatch] Retry sweep error:", err.message);
+  }
+}, 60_000);
+
 // --- Capture Queue: Background Worker ---
 const QUEUE_MAX_RETRIES = 5;
 const QUEUE_BASE_DELAY_MS = 5000;
@@ -378,11 +552,15 @@ async function processQueueItem(item) {
     const mergedMetadata = { ...metadata, ...(item.metadata || {}) };
     if (item.source) mergedMetadata.source = item.source;
 
-    await pool.query(
+    const insertResult = await pool.query(
       `INSERT INTO thoughts (content, embedding, metadata, content_hash)
-       VALUES ($1, $2::vector, $3, $4)`,
+       VALUES ($1, $2::vector, $3, $4) RETURNING id`,
       [item.content, `[${embedding.join(",")}]`, mergedMetadata, hash],
     );
+    const thoughtId = insertResult.rows[0].id;
+
+    // Dispatch action items to DudeDash (non-blocking on failure)
+    await dispatchActionItems(thoughtId, mergedMetadata, item.content);
   }
 
   // Mark as complete
@@ -919,6 +1097,31 @@ app.post("/thoughts/:id/restore", async (req, res) => {
     });
   } catch (error) {
     console.error("Restore error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /dispatch-log - Recent task dispatch activity
+app.get("/dispatch-log", async (req, res) => {
+  try {
+    const status = req.query.status || null;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+
+    const result = await pool.query(
+      `SELECT id, thought_id, action_item_text, dudedash_task_id,
+              status, retry_count, last_error, created_at, dispatched_at
+       FROM task_dispatch_log
+       WHERE ($1::text IS NULL OR status = $1)
+       ORDER BY created_at DESC LIMIT $2`,
+      [status, limit],
+    );
+
+    res.json({
+      count: result.rows.length,
+      entries: result.rows,
+    });
+  } catch (error) {
+    console.error("Dispatch log error:", error);
     res.status(500).json({ error: error.message });
   }
 });
