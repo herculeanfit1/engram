@@ -17,7 +17,7 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 # Copy application
-COPY --chown=1001:1001 index.js ./
+COPY --chown=1001:1001 index.js processor.worker.js ./
 
 USER engram
 

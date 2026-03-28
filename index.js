@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { Worker } from "node:worker_threads";
 import express from "express";
 import pg from "pg";
 
@@ -15,19 +16,13 @@ const pool = new pg.Pool({
   max: 10,
 });
 
-// Ollama config
+// Ollama config (needed for /search embedding generation on main thread)
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || "bge-m3";
 const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || "qwen2.5:32b";
 const OLLAMA_AUTH = process.env.OLLAMA_AUTH || "";
 
-// Chunking config
-const LONG_CONTENT_THRESHOLD = 6000;
-const CHUNK_SIZE = 1500;
-const CHUNK_OVERLAP = 200;
-const SUMMARY_TIMEOUT_MS = 300_000;
-
-// Content hashing for dedup
+// Content hashing for dedup (needed by /capture on main thread)
 function contentHash(text) {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
@@ -42,21 +37,13 @@ function ollamaHeaders() {
   return h;
 }
 
-// Test DB connection on startup
-pool
-  .connect()
-  .then((client) => {
-    client.release();
-    console.log("PostgreSQL connected");
-  })
-  .catch((err) => console.error("PostgreSQL connection failed:", err.message));
-
-// Generate embedding via Ollama
+// Generate embedding via Ollama (needed for /search on main thread)
 async function generateEmbedding(text) {
   const response = await fetch(`${OLLAMA_URL}/api/embeddings`, {
     method: "POST",
     headers: ollamaHeaders(),
     body: JSON.stringify({ model: EMBED_MODEL, prompt: text }),
+    signal: AbortSignal.timeout(60_000),
   });
 
   if (!response.ok) {
@@ -70,569 +57,84 @@ async function generateEmbedding(text) {
   return data.embedding;
 }
 
-// Extract metadata via LLM
-async function extractMetadata(text) {
-  const prompt = `Extract from this text:
-- people: [names mentioned]
-- topics: [3-5 main topics]
-- type: [conversation|decision|insight|meeting|idea|question|note]
-- action_items: [things to do]
+// Test DB connection on startup
+pool
+  .connect()
+  .then((client) => {
+    client.release();
+    console.log("PostgreSQL connected");
+  })
+  .catch((err) => console.error("PostgreSQL connection failed:", err.message));
 
-Text: ${text}
+// ============================================================
+// Worker Thread Lifecycle
+// ============================================================
 
-JSON only, no explanation:`;
+let worker;
 
-  try {
-    const response = await fetch(`${OLLAMA_URL}/api/generate`, {
-      method: "POST",
-      headers: ollamaHeaders(),
-      body: JSON.stringify({
-        model: CHAT_MODEL,
-        prompt,
-        stream: false,
-        options: { temperature: 0.3, num_predict: 300 },
-      }),
-    });
+function spawnWorker() {
+  worker = new Worker(new URL("./processor.worker.js", import.meta.url), {
+    workerData: {
+      dbHost: process.env.DB_HOST || "localhost",
+      dbPort: parseInt(process.env.DB_PORT || "5432", 10),
+      dbName: process.env.DB_NAME || "engram",
+      dbUser: process.env.DB_USER || "engram",
+      dbPassword: process.env.DB_PASSWORD,
+      ollamaUrl: OLLAMA_URL,
+      ollamaAuth: OLLAMA_AUTH,
+      ollamaEmbedModel: EMBED_MODEL,
+      ollamaChatModel: CHAT_MODEL,
+      dudedashUrl: process.env.DUDEDASH_URL || "",
+      dudedashApiKey: process.env.DUDEDASH_API_KEY || "",
+      dispatchEnabled: process.env.DISPATCH_ENABLED !== "false",
+    },
+  });
 
-    if (!response.ok) {
-      console.warn(
-        `LLM API returned ${response.status}, using fallback metadata`,
-      );
-      return { type: "unknown", topics: [], people: [], action_items: [] };
-    }
-
-    const data = await response.json();
-    let jsonText = data.response.trim();
-    if (jsonText.startsWith("```")) {
-      jsonText = jsonText
-        .replace(/^```(?:json)?\s*/, "")
-        .replace(/```\s*$/, "");
-    }
-    return JSON.parse(jsonText);
-  } catch (error) {
-    console.warn("Metadata extraction failed, using fallback:", error.message);
-    return { type: "unknown", topics: [], people: [], action_items: [] };
-  }
-}
-
-// --- Chunking Utilities ---
-
-function chunkText(text, chunkSize = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
-  const chunks = [];
-  let start = 0;
-
-  while (start < text.length) {
-    let end = Math.min(start + chunkSize, text.length);
-
-    // If not the last chunk, find a sentence or whitespace boundary
-    if (end < text.length) {
-      // Look for sentence boundary (". " or "\n") within ±100 chars of target
-      const searchStart = Math.max(end - 100, start);
-      const searchEnd = Math.min(end + 100, text.length);
-      const window = text.slice(searchStart, searchEnd);
-
-      // Prefer sentence-ending boundary closest to target end
-      let bestBreak = -1;
-      const targetOffset = end - searchStart;
-      for (const pattern of [". ", ".\n", "? ", "!\n", "! ", "?\n", "\n"]) {
-        let idx = window.lastIndexOf(pattern, targetOffset + 100);
-        while (idx >= 0) {
-          const absPos = searchStart + idx + pattern.length;
-          if (absPos > start && absPos <= searchEnd) {
-            if (
-              bestBreak === -1 ||
-              Math.abs(absPos - end) < Math.abs(bestBreak - end)
-            ) {
-              bestBreak = absPos;
-            }
-          }
-          idx = window.lastIndexOf(pattern, idx - 1);
-          if (idx < 0) break;
-        }
-      }
-
-      if (bestBreak > start) {
-        end = bestBreak;
-      } else {
-        // Fall back to nearest whitespace
-        const wsIdx = text.lastIndexOf(" ", end);
-        if (wsIdx > start) end = wsIdx + 1;
-      }
-    }
-
-    chunks.push({
-      text: text.slice(start, end),
-      charStart: start,
-      charEnd: end,
-    });
-
-    // Advance by (end - overlap), but ensure forward progress
-    const nextStart = end - overlap;
-    start = nextStart > start ? nextStart : end;
-  }
-
-  return chunks;
-}
-
-// Generate summary via LLM with timeout
-async function generateSummary(text) {
-  const prompt = `You are a meeting transcript summarizer. Produce a concise summary (300-500 words) of the following transcript. Capture: key decisions made, action items with owners, major discussion topics, and any unresolved questions. Format as structured prose, not bullet lists.
-
-Transcript:
-${text}
-
-Summary:`;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), SUMMARY_TIMEOUT_MS);
-
-  try {
-    const response = await fetch(`${OLLAMA_URL}/api/generate`, {
-      method: "POST",
-      headers: ollamaHeaders(),
-      signal: controller.signal,
-      body: JSON.stringify({
-        model: CHAT_MODEL,
-        prompt,
-        stream: false,
-        options: { temperature: 0.3, num_predict: 1000 },
-      }),
-    });
-
-    if (!response.ok) {
-      console.warn(
-        `[Chunk] Summary LLM returned ${response.status}, skipping summary`,
-      );
-      return null;
-    }
-
-    const data = await response.json();
-    return data.response.trim();
-  } catch (error) {
-    console.warn("[Chunk] Summary generation failed:", error.message);
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-// --- Process Long Content (Hybrid Chunk + Summary) ---
-
-async function processLongContent(item, mergedMetadata, hash) {
-  const t0 = Date.now();
-  const groupId = crypto.randomUUID();
-  const content = item.content;
-  const charCount = content.length;
-
-  console.log(
-    `[Chunk] Processing long content: ${charCount} chars, group ${groupId}`,
-  );
-
-  // Step A: Generate summary (non-blocking on failure)
-  const summaryT0 = Date.now();
-  const summary = await generateSummary(content);
-  const summaryMs = Date.now() - summaryT0;
-  console.log(
-    `[Chunk] Summary: ${summary ? `${summary.length} chars` : "skipped"} (${summaryMs}ms)`,
-  );
-
-  // Step B: Chunk the full text
-  const chunkT0 = Date.now();
-  const chunks = chunkText(content);
-  const totalChunks = chunks.length;
-  const chunkMs = Date.now() - chunkT0;
-  console.log(`[Chunk] Split into ${totalChunks} chunks (${chunkMs}ms)`);
-
-  // Step C: Generate embeddings
-  const embedT0 = Date.now();
-
-  // Master embedding: use summary if available, else first chunk
-  const masterEmbedText = summary || chunks[0].text;
-  const masterEmbedding = await generateEmbedding(masterEmbedText);
-
-  // Chunk embeddings (sequential to avoid overwhelming Ollama)
-  const chunkEmbeddings = [];
-  for (let i = 0; i < chunks.length; i++) {
-    try {
-      const emb = await generateEmbedding(chunks[i].text);
-      chunkEmbeddings.push(emb);
-    } catch (err) {
-      console.warn(
-        `[Chunk] Embedding failed for chunk ${i + 1}/${totalChunks}: ${err.message}`,
-      );
-      chunkEmbeddings.push(null);
-    }
-  }
-
-  const embedMs = Date.now() - embedT0;
-  const embedFailed = chunkEmbeddings.filter((e) => e === null).length;
-  console.log(
-    `[Chunk] Embeddings: ${totalChunks - embedFailed}/${totalChunks} succeeded (${embedMs}ms)`,
-  );
-
-  // Step D: Extract metadata from summary or full text
-  const metadataText = summary || content.substring(0, 6000);
-  const extractedMeta = await extractMetadata(metadataText);
-  const masterMeta = {
-    ...extractedMeta,
-    ...mergedMetadata,
-    char_count: charCount,
-    chunk_size: CHUNK_SIZE,
-    overlap: CHUNK_OVERLAP,
-    model_embedding: EMBED_MODEL,
-    model_summary: CHAT_MODEL,
-  };
-
-  // Step E: Store in database
-  const dbT0 = Date.now();
-
-  // Master thought — stores full transcript + summary
-  const masterInsert = await pool.query(
-    `INSERT INTO thoughts
-       (content, embedding, metadata, group_id, thought_type, total_chunks, summary, content_hash)
-     VALUES ($1, $2::vector, $3, $4, 'transcript_master', $5, $6, $7) RETURNING id`,
-    [
-      content,
-      `[${masterEmbedding.join(",")}]`,
-      masterMeta,
-      groupId,
-      totalChunks,
-      summary,
-      hash,
-    ],
-  );
-  const masterId = masterInsert.rows[0].id;
-
-  // Dispatch action items to DudeDash (non-blocking on failure)
-  await dispatchActionItems(masterId, masterMeta, content.substring(0, 500));
-
-  // Chunk thoughts
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    const emb = chunkEmbeddings[i];
-    const chunkMeta = {
-      ...mergedMetadata,
-      char_start: chunk.charStart,
-      char_end: chunk.charEnd,
-      parent_group_id: groupId,
-    };
-
-    if (emb) {
-      await pool.query(
-        `INSERT INTO thoughts
-           (content, embedding, metadata, group_id, thought_type, chunk_index, total_chunks)
-         VALUES ($1, $2::vector, $3, $4, 'transcript_chunk', $5, $6)`,
-        [
-          chunk.text,
-          `[${emb.join(",")}]`,
-          chunkMeta,
-          groupId,
-          i + 1,
-          totalChunks,
-        ],
-      );
-    } else {
-      // Store without embedding — still searchable by metadata
-      await pool.query(
-        `INSERT INTO thoughts
-           (content, metadata, group_id, thought_type, chunk_index, total_chunks)
-         VALUES ($1, $2, $3, 'transcript_chunk', $4, $5)`,
-        [chunk.text, chunkMeta, groupId, i + 1, totalChunks],
-      );
-    }
-  }
-
-  const dbMs = Date.now() - dbT0;
-  const totalMs = Date.now() - t0;
-
-  console.log(
-    `[Chunk] Stored: 1 master + ${totalChunks} chunks, group ${groupId} (db: ${dbMs}ms, total: ${totalMs}ms)`,
-  );
-
-  return { groupId, totalChunks, summaryGenerated: !!summary };
-}
-
-// --- DudeDash Task Dispatch ---
-const DUDEDASH_URL = process.env.DUDEDASH_URL || "";
-const DUDEDASH_API_KEY = process.env.DUDEDASH_API_KEY || "";
-const DISPATCH_TIMEOUT_MS = 5000;
-const DISPATCH_MAX_RETRIES = 5;
-
-function actionItemHash(text) {
-  const normalized = text.toLowerCase().trim().replace(/\s+/g, " ");
-  return crypto.createHash("sha256").update(normalized).digest("hex");
-}
-
-async function dispatchActionItems(thoughtId, metadata, contentPreview) {
-  if (!DUDEDASH_URL || !DUDEDASH_API_KEY) return;
-  const items = metadata?.action_items;
-  if (!Array.isArray(items) || items.length === 0) return;
-
-  for (const item of items) {
-    if (typeof item !== "string" || !item.trim()) continue;
-    const hash = actionItemHash(item);
-
-    try {
-      // Dedup: insert only if hash is new
-      const ins = await pool.query(
-        `INSERT INTO task_dispatch_log (thought_id, action_item_hash, action_item_text)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (action_item_hash) DO NOTHING
-         RETURNING id`,
-        [thoughtId, hash, item],
-      );
-      if (ins.rows.length === 0) {
-        console.log(`[Dispatch] Duplicate skipped: ${item.substring(0, 60)}`);
-        continue;
-      }
-      const logId = ins.rows[0].id;
-
-      // POST to DudeDash
-      const preview = (contentPreview || "").substring(0, 500);
-      const payload = {
-        title: item,
-        description: `[Engram thought ${thoughtId}]\n\n${preview}`,
-        column: "backlog",
-        tags: Array.isArray(metadata.topics) ? metadata.topics : [],
-        assignee: ["tk"],
-        category: "personal",
-        priority: "medium",
-        source: "a2a",
-      };
-
-      const resp = await fetch(`${DUDEDASH_URL}/api/tasks`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": DUDEDASH_API_KEY,
-        },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(DISPATCH_TIMEOUT_MS),
-      });
-
-      if (resp.ok) {
-        const task = await resp.json();
-        await pool.query(
-          `UPDATE task_dispatch_log
-           SET status = 'dispatched', dudedash_task_id = $1, dispatched_at = NOW()
-           WHERE id = $2`,
-          [task.id, logId],
-        );
+  worker.on("message", (msg) => {
+    switch (msg.type) {
+      case "ready":
+        console.log("[Main] Worker thread ready");
+        break;
+      case "complete":
         console.log(
-          `[Dispatch] Task created: "${item.substring(0, 60)}" -> ${task.id}`,
+          `[Main] Processed: ${msg.thoughtId} (${msg.chars} chars, ${msg.chunks ?? 0} chunks, ${msg.ms}ms)`,
         );
-      } else {
-        const errBody = await resp.text().catch(() => "");
-        await pool.query(
-          `UPDATE task_dispatch_log SET status = 'failed', last_error = $1 WHERE id = $2`,
-          [`HTTP ${resp.status}: ${errBody.substring(0, 200)}`, logId],
-        );
-        console.warn(
-          `[Dispatch] Failed (${resp.status}): ${item.substring(0, 60)}`,
-        );
-      }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : "Unknown error";
-      // Update if the row was inserted; ignore if dedup blocked it
-      await pool
-        .query(
-          `UPDATE task_dispatch_log
-           SET status = 'failed', last_error = $1
-           WHERE action_item_hash = $2 AND status = 'pending'`,
-          [errMsg.substring(0, 500), hash],
-        )
-        .catch(() => {});
-      console.warn(`[Dispatch] Error: ${errMsg} — ${item.substring(0, 60)}`);
-    }
-  }
-}
-
-// Retry failed dispatches every 60 seconds
-setInterval(async () => {
-  if (!DUDEDASH_URL || !DUDEDASH_API_KEY) return;
-  try {
-    const failed = await pool.query(
-      `SELECT id, action_item_text, thought_id, retry_count
-       FROM task_dispatch_log
-       WHERE status = 'failed' AND retry_count < $1
-         AND created_at > NOW() - INTERVAL '24 hours'
-       ORDER BY created_at LIMIT 10`,
-      [DISPATCH_MAX_RETRIES],
-    );
-    for (const row of failed.rows) {
-      try {
-        // Re-fetch thought content for description
-        const thought = await pool.query(
-          `SELECT content FROM thoughts WHERE id = $1`,
-          [row.thought_id],
-        );
-        const preview = thought.rows[0]?.content?.substring(0, 500) || "";
-
-        const resp = await fetch(`${DUDEDASH_URL}/api/tasks`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": DUDEDASH_API_KEY,
-          },
-          body: JSON.stringify({
-            title: row.action_item_text,
-            description: `[Engram thought ${row.thought_id}]\n\n${preview}`,
-            column: "backlog",
-            tags: [],
-            assignee: ["tk"],
-            category: "personal",
-            priority: "medium",
-            source: "a2a",
-          }),
-          signal: AbortSignal.timeout(DISPATCH_TIMEOUT_MS),
-        });
-
-        if (resp.ok) {
-          const task = await resp.json();
-          await pool.query(
-            `UPDATE task_dispatch_log
-             SET status = 'dispatched', dudedash_task_id = $1, dispatched_at = NOW(), retry_count = $2
-             WHERE id = $3`,
-            [task.id, row.retry_count + 1, row.id],
-          );
-          console.log(
-            `[Dispatch] Retry succeeded: "${row.action_item_text.substring(0, 60)}" -> ${task.id}`,
-          );
+        // Future Phase 3.5: fire n8n webhook here (fire-and-forget)
+        break;
+      case "error":
+        console.error(`[Main] Failed: ${msg.thoughtId} — ${msg.error}`);
+        break;
+      case "log":
+        if (msg.level === "error") {
+          console.error(`[Main<-Worker] ${msg.message}`);
         } else {
-          const errBody = await resp.text().catch(() => "");
-          await pool.query(
-            `UPDATE task_dispatch_log SET last_error = $1, retry_count = $2 WHERE id = $3`,
-            [
-              `HTTP ${resp.status}: ${errBody.substring(0, 200)}`,
-              row.retry_count + 1,
-              row.id,
-            ],
-          );
+          console.log(`[Main<-Worker] ${msg.message}`);
         }
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : "Unknown error";
-        await pool.query(
-          `UPDATE task_dispatch_log SET last_error = $1, retry_count = $2 WHERE id = $3`,
-          [errMsg.substring(0, 500), row.retry_count + 1, row.id],
-        );
-      }
+        break;
     }
-  } catch (err) {
-    console.error("[Dispatch] Retry sweep error:", err.message);
-  }
-}, 60_000);
+  });
 
-// --- Capture Queue: Background Worker ---
-const QUEUE_MAX_RETRIES = 5;
-const QUEUE_BASE_DELAY_MS = 5000;
-let queueWorkerRunning = false;
+  worker.on("error", (err) => {
+    console.error("[Main] Worker error:", err);
+  });
 
-async function processQueueItem(item) {
-  // Mark as processing
-  await pool.query(
-    `UPDATE capture_queue SET status = 'processing' WHERE id = $1`,
-    [item.id],
-  );
+  worker.on("exit", (code) => {
+    if (code !== 0 && !shuttingDown) {
+      console.error(`[Main] Worker exited (code ${code}), respawning in 5s...`);
+      setTimeout(spawnWorker, 5000);
+    }
+  });
 
-  const isLong = item.content.length > LONG_CONTENT_THRESHOLD;
-  const hash = item.content_hash || contentHash(item.content);
-
-  if (isLong) {
-    // Hybrid chunk + summary pipeline
-    const mergedMetadata = { ...(item.metadata || {}) };
-    if (item.source) mergedMetadata.source = item.source;
-    await processLongContent(item, mergedMetadata, hash);
-  } else {
-    // Short content — single thought, single embedding
-    const [embedding, metadata] = await Promise.all([
-      generateEmbedding(item.content),
-      extractMetadata(item.content),
-    ]);
-
-    const mergedMetadata = { ...metadata, ...(item.metadata || {}) };
-    if (item.source) mergedMetadata.source = item.source;
-
-    const insertResult = await pool.query(
-      `INSERT INTO thoughts (content, embedding, metadata, content_hash)
-       VALUES ($1, $2::vector, $3, $4) RETURNING id`,
-      [item.content, `[${embedding.join(",")}]`, mergedMetadata, hash],
-    );
-    const thoughtId = insertResult.rows[0].id;
-
-    // Dispatch action items to DudeDash (non-blocking on failure)
-    await dispatchActionItems(thoughtId, mergedMetadata, item.content);
-  }
-
-  // Mark as complete
-  await pool.query(
-    `UPDATE capture_queue SET status = 'complete', processed_at = NOW() WHERE id = $1`,
-    [item.id],
-  );
-
-  const preview = item.content.substring(0, 60);
-  console.log(
-    `[Queue] Processed: ${item.id} (${item.content.length} chars${isLong ? ", chunked" : ""}) ${preview}...`,
-  );
+  console.log("[Main] Worker thread spawned");
 }
 
-async function processQueue() {
-  if (queueWorkerRunning) return;
-  queueWorkerRunning = true;
+let shuttingDown = false;
 
-  try {
-    while (true) {
-      const pending = await pool.query(
-        `SELECT * FROM capture_queue
-         WHERE status = 'pending'
-         ORDER BY created_at LIMIT 1`,
-      );
+spawnWorker();
 
-      if (pending.rows.length === 0) break;
-
-      const item = pending.rows[0];
-
-      try {
-        await processQueueItem(item);
-      } catch (err) {
-        const retryCount = item.retry_count + 1;
-        const errorMsg = err instanceof Error ? err.message : "Unknown error";
-
-        if (retryCount >= QUEUE_MAX_RETRIES) {
-          await pool.query(
-            `UPDATE capture_queue
-             SET status = 'failed', last_error = $1, retry_count = $2
-             WHERE id = $3`,
-            [errorMsg, retryCount, item.id],
-          );
-          console.error(
-            `[Queue] Failed permanently after ${retryCount} retries: ${item.id} — ${errorMsg}`,
-          );
-        } else {
-          await pool.query(
-            `UPDATE capture_queue
-             SET status = 'pending', last_error = $1, retry_count = $2
-             WHERE id = $3`,
-            [errorMsg, retryCount, item.id],
-          );
-          console.warn(
-            `[Queue] Retry ${retryCount}/${QUEUE_MAX_RETRIES} for ${item.id} — ${errorMsg}`,
-          );
-          const delay = QUEUE_BASE_DELAY_MS * 2 ** (retryCount - 1);
-          await new Promise((resolve) => setTimeout(resolve, delay));
-        }
-      }
-    }
-  } finally {
-    queueWorkerRunning = false;
-  }
-}
-
-// Poll for pending items every 10 seconds
-setInterval(() => {
-  processQueue().catch((err) =>
-    console.error("[Queue] Worker error:", err.message),
-  );
-}, 10_000);
+// ============================================================
+// Express Routes
+// ============================================================
 
 // POST /capture - Queue a thought for async processing
 app.post("/capture", async (req, res) => {
@@ -707,9 +209,8 @@ app.post("/capture", async (req, res) => {
       message: "Capture queued for processing",
     });
 
-    processQueue().catch((err) =>
-      console.error("[Queue] Processing error:", err.message),
-    );
+    // Wake up worker to process immediately instead of waiting for poll interval
+    if (worker) worker.postMessage({ type: "wake" });
   } catch (error) {
     console.error("Capture error:", error);
     res.status(500).json({ error: error.message });
@@ -1171,24 +672,29 @@ app.get("/health", async (_req, res) => {
     res.json({
       status: "ok",
       service: "engram",
-      version: "2.0.0",
+      version: "2.1.0",
       database: "connected",
       queue_pending: pending.rows[0].count,
       embed_model: EMBED_MODEL,
+      worker: worker && !worker.threadId ? "stopped" : "running",
     });
   } catch (error) {
     res.status(500).json({
       status: "error",
       service: "engram",
-      version: "2.0.0",
+      version: "2.1.0",
       database: "disconnected",
       error: error.message,
     });
   }
 });
 
+// ============================================================
+// Server Start + Graceful Shutdown
+// ============================================================
+
 const PORT = parseInt(process.env.PORT || "3700", 10);
-app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Engram API listening on port ${PORT}`);
   console.log(
     `Database: ${process.env.DB_HOST || "localhost"}/${process.env.DB_NAME || "engram"}`,
@@ -1196,7 +702,30 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `Ollama: ${OLLAMA_URL} (embed: ${EMBED_MODEL}, chat: ${CHAT_MODEL})`,
   );
-  console.log(
-    `Chunking: threshold=${LONG_CONTENT_THRESHOLD}, size=${CHUNK_SIZE}, overlap=${CHUNK_OVERLAP}`,
-  );
+  console.log("[Main] Processing offloaded to worker thread");
+});
+
+process.on("SIGTERM", async () => {
+  console.log("[Main] SIGTERM received, shutting down...");
+  shuttingDown = true;
+  server.close();
+
+  if (worker) {
+    worker.postMessage({ type: "shutdown" });
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        console.log("[Main] Worker shutdown timeout, terminating");
+        worker.terminate();
+        resolve();
+      }, 30_000);
+      worker.on("exit", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+  }
+
+  await pool.end();
+  console.log("[Main] Shutdown complete");
+  process.exit(0);
 });
