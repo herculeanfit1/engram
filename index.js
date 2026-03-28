@@ -86,6 +86,7 @@ function spawnWorker() {
       ollamaChatModel: CHAT_MODEL,
       dudedashUrl: process.env.DUDEDASH_URL || "",
       dudedashApiKey: process.env.DUDEDASH_API_KEY || "",
+      dispatchEnabled: process.env.DISPATCH_ENABLED !== "false",
     },
   });
 

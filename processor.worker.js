@@ -36,6 +36,7 @@ const EMBED_MODEL = workerData.ollamaEmbedModel;
 const CHAT_MODEL = workerData.ollamaChatModel;
 const DUDEDASH_URL = workerData.dudedashUrl;
 const DUDEDASH_API_KEY = workerData.dudedashApiKey;
+const DISPATCH_ENABLED = workerData.dispatchEnabled;
 
 // --- Chunking config ---
 const LONG_CONTENT_THRESHOLD = 6000;
@@ -231,7 +232,7 @@ function actionItemHash(text) {
 }
 
 async function dispatchActionItems(thoughtId, metadata, contentPreview) {
-  if (!DUDEDASH_URL || !DUDEDASH_API_KEY) return;
+  if (!DISPATCH_ENABLED || !DUDEDASH_URL || !DUDEDASH_API_KEY) return;
   const items = metadata?.action_items;
   if (!Array.isArray(items) || items.length === 0) return;
 
@@ -313,7 +314,7 @@ async function dispatchActionItems(thoughtId, metadata, contentPreview) {
 
 // --- Dispatch retry sweep (every 60s) ---
 const dispatchRetryInterval = setInterval(async () => {
-  if (shuttingDown || !DUDEDASH_URL || !DUDEDASH_API_KEY) return;
+  if (shuttingDown || !DISPATCH_ENABLED || !DUDEDASH_URL || !DUDEDASH_API_KEY) return;
   try {
     const failed = await pool.query(
       `SELECT id, action_item_text, thought_id, retry_count
@@ -720,6 +721,7 @@ pool
 // --- Notify main thread ---
 parentPort.postMessage({ type: "ready" });
 console.log("[Worker] Processing worker started");
+console.log(`[Worker] Task dispatch: ${DISPATCH_ENABLED ? "enabled" : "DISABLED"}`);
 
 // --- Clean exit ---
 process.on("beforeExit", async () => {
