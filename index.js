@@ -120,9 +120,7 @@ function spawnWorker() {
 
   worker.on("exit", (code) => {
     if (code !== 0 && !shuttingDown) {
-      console.error(
-        `[Main] Worker exited (code ${code}), respawning in 5s...`,
-      );
+      console.error(`[Main] Worker exited (code ${code}), respawning in 5s...`);
       setTimeout(spawnWorker, 5000);
     }
   });

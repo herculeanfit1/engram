@@ -2,8 +2,8 @@
 // Runs the full pipeline (LLM summary, chunking, embedding, metadata, dispatch)
 // off the main Express thread so /health and /search stay responsive.
 
-import { parentPort, workerData } from "node:worker_threads";
 import crypto from "node:crypto";
+import { parentPort, workerData } from "node:worker_threads";
 import pg from "pg";
 
 // --- Catch silent failures in the worker thread ---
@@ -314,7 +314,8 @@ async function dispatchActionItems(thoughtId, metadata, contentPreview) {
 
 // --- Dispatch retry sweep (every 60s) ---
 const dispatchRetryInterval = setInterval(async () => {
-  if (shuttingDown || !DISPATCH_ENABLED || !DUDEDASH_URL || !DUDEDASH_API_KEY) return;
+  if (shuttingDown || !DISPATCH_ENABLED || !DUDEDASH_URL || !DUDEDASH_API_KEY)
+    return;
   try {
     const failed = await pool.query(
       `SELECT id, action_item_text, thought_id, retry_count
@@ -405,34 +406,66 @@ async function processLongContent(item, mergedMetadata, hash) {
   let summary;
   try {
     summary = await generateSummary(content);
-    parentPort.postMessage({ type: "log", level: "info", message: `generateSummary RESOLVED, length: ${summary?.length}` });
+    parentPort.postMessage({
+      type: "log",
+      level: "info",
+      message: `generateSummary RESOLVED, length: ${summary?.length}`,
+    });
   } catch (err) {
-    parentPort.postMessage({ type: "log", level: "error", message: `generateSummary REJECTED: ${err?.stack || err}` });
+    parentPort.postMessage({
+      type: "log",
+      level: "error",
+      message: `generateSummary REJECTED: ${err?.stack || err}`,
+    });
     throw err;
   }
   if (shuttingDown) throw new Error("Shutdown requested");
   const summaryMs = Date.now() - summaryT0;
-  parentPort.postMessage({ type: "log", level: "info", message: `Summary: ${summary ? `${summary.length} chars` : "skipped"} (${summaryMs}ms)` });
+  parentPort.postMessage({
+    type: "log",
+    level: "info",
+    message: `Summary: ${summary ? `${summary.length} chars` : "skipped"} (${summaryMs}ms)`,
+  });
 
   // Step B: Chunk the full text
-  parentPort.postMessage({ type: "log", level: "info", message: `[B1] Before chunkText (${charCount} chars)` });
+  parentPort.postMessage({
+    type: "log",
+    level: "info",
+    message: `[B1] Before chunkText (${charCount} chars)`,
+  });
   const chunkT0 = Date.now();
   const chunks = chunkText(content);
   const totalChunks = chunks.length;
   const chunkMs = Date.now() - chunkT0;
-  parentPort.postMessage({ type: "log", level: "info", message: `[B2] After chunkText: ${totalChunks} chunks (${chunkMs}ms)` });
+  parentPort.postMessage({
+    type: "log",
+    level: "info",
+    message: `[B2] After chunkText: ${totalChunks} chunks (${chunkMs}ms)`,
+  });
 
   // Step C: Generate embeddings
   const embedT0 = Date.now();
 
   const masterEmbedText = summary || chunks[0].text;
-  parentPort.postMessage({ type: "log", level: "info", message: `[C1] Before master embedding (${masterEmbedText.length} chars)` });
+  parentPort.postMessage({
+    type: "log",
+    level: "info",
+    message: `[C1] Before master embedding (${masterEmbedText.length} chars)`,
+  });
   let masterEmbedding;
   try {
     masterEmbedding = await generateEmbedding(masterEmbedText);
-    parentPort.postMessage({ type: "log", level: "info", message: `Master embedding done: ${masterEmbedding?.length} dims (${Date.now() - embedT0}ms)` });
+    parentPort.postMessage({
+      type: "log",
+      level: "info",
+      message: `Master embedding done: ${masterEmbedding?.length} dims (${Date.now() - embedT0}ms)`,
+    });
   } catch (err) {
-    parentPort.postMessage({ type: "log", level: "error", message: `Master embedding FAILED: ${err.message} (${Date.now() - embedT0}ms)` });
+    parentPort.postMessage({
+      type: "log",
+      level: "error",
+      message: `Master embedding FAILED: ${err.message} (${Date.now() - embedT0}ms)`,
+    });
     throw err;
   }
   if (shuttingDown) throw new Error("Shutdown requested");
@@ -441,11 +474,20 @@ async function processLongContent(item, mergedMetadata, hash) {
   for (let i = 0; i < chunks.length; i++) {
     const chunkEmbedT0 = Date.now();
     try {
-      if (i % 5 === 0) parentPort.postMessage({ type: "log", level: "info", message: `Embedding chunk ${i + 1}/${totalChunks}...` });
+      if (i % 5 === 0)
+        parentPort.postMessage({
+          type: "log",
+          level: "info",
+          message: `Embedding chunk ${i + 1}/${totalChunks}...`,
+        });
       const emb = await generateEmbedding(chunks[i].text);
       chunkEmbeddings.push(emb);
     } catch (err) {
-      parentPort.postMessage({ type: "log", level: "error", message: `Embedding failed chunk ${i + 1}/${totalChunks}: ${err.message} (${Date.now() - chunkEmbedT0}ms)` });
+      parentPort.postMessage({
+        type: "log",
+        level: "error",
+        message: `Embedding failed chunk ${i + 1}/${totalChunks}: ${err.message} (${Date.now() - chunkEmbedT0}ms)`,
+      });
       chunkEmbeddings.push(null);
     }
     if (shuttingDown) throw new Error("Shutdown requested");
@@ -721,7 +763,9 @@ pool
 // --- Notify main thread ---
 parentPort.postMessage({ type: "ready" });
 console.log("[Worker] Processing worker started");
-console.log(`[Worker] Task dispatch: ${DISPATCH_ENABLED ? "enabled" : "DISABLED"}`);
+console.log(
+  `[Worker] Task dispatch: ${DISPATCH_ENABLED ? "enabled" : "DISABLED"}`,
+);
 
 // --- Clean exit ---
 process.on("beforeExit", async () => {
