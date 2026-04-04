@@ -3,6 +3,7 @@
 // off the main Express thread so /health and /search stay responsive.
 
 import crypto from "node:crypto";
+import fs from "node:fs";
 import { parentPort, workerData } from "node:worker_threads";
 import pg from "pg";
 
@@ -37,6 +38,8 @@ const CHAT_MODEL = workerData.ollamaChatModel;
 const DUDEDASH_URL = workerData.dudedashUrl;
 const DUDEDASH_API_KEY = workerData.dudedashApiKey;
 const DISPATCH_ENABLED = workerData.dispatchEnabled;
+const OPENBRAIN_MCP_URL = workerData.openbrainMcpUrl;
+const WHISPER_URL = workerData.whisperUrl;
 
 // --- Chunking config ---
 const LONG_CONTENT_THRESHOLD = 6000;
@@ -49,6 +52,8 @@ const QUEUE_MAX_RETRIES = 5;
 const QUEUE_BASE_DELAY_MS = 5000;
 const DISPATCH_TIMEOUT_MS = 5000;
 const DISPATCH_MAX_RETRIES = 5;
+const OPENBRAIN_TIMEOUT_MS = 15_000;
+const WHISPER_TIMEOUT_MS = 600_000; // 10 min for long audio
 
 let shuttingDown = false;
 let queueWorkerRunning = false;
@@ -59,6 +64,51 @@ let queueWorkerRunning = false;
 
 function contentHash(text) {
   return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+async function transcribeAudio(audioPath) {
+  if (!WHISPER_URL) throw new Error("WHISPER_URL not configured");
+  if (!fs.existsSync(audioPath))
+    throw new Error(`Audio file not found: ${audioPath}`);
+
+  const fileBuffer = fs.readFileSync(audioPath);
+  const filename = audioPath.split("/").pop();
+  const ext = filename.split(".").pop() || "m4a";
+  const mimeTypes = {
+    m4a: "audio/x-m4a",
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    ogg: "audio/ogg",
+    webm: "audio/webm",
+  };
+
+  const formData = new FormData();
+  formData.append(
+    "file",
+    new File([fileBuffer], filename, { type: mimeTypes[ext] || "audio/mpeg" }),
+  );
+  formData.append("model", "Systran/faster-whisper-small");
+  formData.append("response_format", "json");
+  formData.append("temperature", "0.0");
+
+  const resp = await fetch(`${WHISPER_URL}/v1/audio/transcriptions`, {
+    method: "POST",
+    body: formData,
+    signal: AbortSignal.timeout(WHISPER_TIMEOUT_MS),
+  });
+
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => "");
+    throw new Error(
+      `Whisper returned ${resp.status}: ${errBody.substring(0, 300)}`,
+    );
+  }
+
+  const data = await resp.json();
+  const transcript = (data.text || "").trim();
+  if (!transcript) throw new Error("Transcription produced empty text");
+
+  return transcript;
 }
 
 function ollamaHeaders() {
@@ -312,6 +362,43 @@ async function dispatchActionItems(thoughtId, metadata, contentPreview) {
   }
 }
 
+// --- Forward to Open Brain (Supabase) for cross-AI access ---
+
+async function forwardToOpenBrain(content, metadata) {
+  if (!OPENBRAIN_MCP_URL) return;
+
+  try {
+    const response = await fetch(OPENBRAIN_MCP_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "capture_thought",
+          arguments: {
+            content: content,
+            source: "engram",
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(OPENBRAIN_TIMEOUT_MS),
+    });
+
+    if (response.ok) {
+      console.log(`[OpenBrain] Forwarded: ${content.substring(0, 60)}...`);
+    } else {
+      console.warn(`[OpenBrain] Forward failed: ${response.status}`);
+    }
+  } catch (err) {
+    console.warn(`[OpenBrain] Forward error: ${err.message}`);
+  }
+}
+
 // --- Dispatch retry sweep (every 60s) ---
 const dispatchRetryInterval = setInterval(async () => {
   if (shuttingDown || !DISPATCH_ENABLED || !DUDEDASH_URL || !DUDEDASH_API_KEY)
@@ -535,6 +622,9 @@ async function processLongContent(item, mergedMetadata, hash) {
   // Dispatch action items to DudeDash
   await dispatchActionItems(masterId, masterMeta, content.substring(0, 500));
 
+  // Forward full content to Open Brain (it handles its own chunking)
+  await forwardToOpenBrain(content, masterMeta);
+
   // Chunk thoughts
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
@@ -590,6 +680,43 @@ async function processQueueItem(item) {
     [item.id],
   );
 
+  // Audio items: transcribe first, then process the transcript
+  const audioPath = item.metadata?.audio_path;
+  if (audioPath) {
+    console.log(
+      `[Audio] Transcribing: ${item.metadata.audio_filename || audioPath} (${((item.metadata.audio_size_bytes || 0) / (1024 * 1024)).toFixed(1)}MB)`,
+    );
+    const t0 = Date.now();
+    const transcript = await transcribeAudio(audioPath);
+    const transcribeMs = Date.now() - t0;
+    console.log(
+      `[Audio] Transcribed: ${transcript.length} chars in ${(transcribeMs / 1000).toFixed(1)}s`,
+    );
+
+    // Replace placeholder content with actual transcript
+    item.content = transcript;
+
+    // Update queue row with transcript content and hash for dedup
+    const hash = contentHash(transcript);
+    await pool.query(
+      `UPDATE capture_queue SET content = $1, content_hash = $2 WHERE id = $3`,
+      [transcript, hash, item.id],
+    );
+    item.content_hash = hash;
+
+    // Clean up temp audio file
+    try {
+      fs.unlinkSync(audioPath);
+    } catch {
+      /* already gone */
+    }
+
+    // Add transcription stats to metadata
+    item.metadata.transcribe_ms = transcribeMs;
+    item.metadata.transcript_chars = transcript.length;
+    delete item.metadata.audio_path; // no longer needed
+  }
+
   const isLong = item.content.length > LONG_CONTENT_THRESHOLD;
   const hash = item.content_hash || contentHash(item.content);
 
@@ -615,6 +742,7 @@ async function processQueueItem(item) {
     const thoughtId = insertResult.rows[0].id;
 
     await dispatchActionItems(thoughtId, mergedMetadata, item.content);
+    await forwardToOpenBrain(item.content, mergedMetadata);
   }
 
   await pool.query(
@@ -765,6 +893,9 @@ parentPort.postMessage({ type: "ready" });
 console.log("[Worker] Processing worker started");
 console.log(
   `[Worker] Task dispatch: ${DISPATCH_ENABLED ? "enabled" : "DISABLED"}`,
+);
+console.log(
+  `[Worker] Open Brain forward: ${OPENBRAIN_MCP_URL ? "enabled" : "DISABLED (no OPENBRAIN_MCP_URL)"}`,
 );
 
 // --- Clean exit ---

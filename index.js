@@ -1,7 +1,15 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { Worker } from "node:worker_threads";
 import express from "express";
+import multer from "multer";
 import pg from "pg";
+
+// Temp directory for audio files awaiting transcription
+const AUDIO_TEMP_DIR = "/tmp/engram-audio";
+if (!fs.existsSync(AUDIO_TEMP_DIR))
+  fs.mkdirSync(AUDIO_TEMP_DIR, { recursive: true });
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -21,6 +29,7 @@ const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 const EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || "bge-m3";
 const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || "qwen2.5:32b";
 const OLLAMA_AUTH = process.env.OLLAMA_AUTH || "";
+const WHISPER_URL = process.env.WHISPER_URL || "http://localhost:8000";
 
 // Content hashing for dedup (needed by /capture on main thread)
 function contentHash(text) {
@@ -36,6 +45,19 @@ function ollamaHeaders() {
   if (OLLAMA_AUTH) h.Authorization = `Basic ${OLLAMA_AUTH}`;
   return h;
 }
+
+// Multer config for audio uploads (in-memory, 100MB limit for long meetings)
+const audioUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype.startsWith("audio/")) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Unsupported audio type: ${file.mimetype}`));
+    }
+  },
+});
 
 // Generate embedding via Ollama (needed for /search on main thread)
 async function generateEmbedding(text) {
@@ -87,6 +109,8 @@ function spawnWorker() {
       dudedashUrl: process.env.DUDEDASH_URL || "",
       dudedashApiKey: process.env.DUDEDASH_API_KEY || "",
       dispatchEnabled: process.env.DISPATCH_ENABLED !== "false",
+      openbrainMcpUrl: process.env.OPENBRAIN_MCP_URL || "",
+      whisperUrl: WHISPER_URL,
     },
   });
 
@@ -213,6 +237,74 @@ app.post("/capture", async (req, res) => {
     if (worker) worker.postMessage({ type: "wake" });
   } catch (error) {
     console.error("Capture error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /capture/audio - Accept audio, queue for async transcription + processing
+app.post("/capture/audio", audioUpload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res
+        .status(400)
+        .json({ error: "Audio file required (field: 'file')" });
+    }
+
+    const sizeMB = (req.file.size / (1024 * 1024)).toFixed(1);
+    console.log(
+      `[Audio] Received: ${req.file.originalname || "audio"} (${sizeMB}MB, ${req.file.mimetype})`,
+    );
+
+    // Save audio to temp file for worker to pick up
+    const audioId = crypto.randomUUID();
+    const ext = path.extname(req.file.originalname || ".m4a") || ".m4a";
+    const audioPath = path.join(AUDIO_TEMP_DIR, `${audioId}${ext}`);
+    fs.writeFileSync(audioPath, req.file.buffer);
+
+    // Build metadata
+    const source = req.body?.source || "audio-transcription";
+    let extraMetadata = {};
+    if (req.body?.metadata) {
+      try {
+        extraMetadata = JSON.parse(req.body.metadata);
+      } catch {
+        // ignore malformed metadata from form field
+      }
+    }
+    extraMetadata.audio_source = true;
+    extraMetadata.audio_path = audioPath;
+    extraMetadata.audio_filename = req.file.originalname || null;
+    extraMetadata.audio_mimetype = req.file.mimetype;
+    extraMetadata.audio_size_bytes = req.file.size;
+
+    // Insert into capture queue with placeholder content (worker will replace with transcript)
+    const result = await pool.query(
+      `INSERT INTO capture_queue (content, source, metadata)
+       VALUES ($1, $2, $3)
+       RETURNING id, created_at`,
+      [
+        `[audio pending transcription: ${req.file.originalname || "audio"}, ${sizeMB}MB]`,
+        source,
+        extraMetadata,
+      ],
+    );
+
+    console.log(
+      `[Audio] Queued for transcription: ${result.rows[0].id} (${sizeMB}MB, saved to ${audioPath})`,
+    );
+
+    res.status(202).json({
+      status: "queued",
+      id: result.rows[0].id,
+      created_at: result.rows[0].created_at,
+      audio_size_mb: parseFloat(sizeMB),
+      message:
+        "Audio accepted — transcription and processing will happen in the background",
+    });
+
+    if (worker) worker.postMessage({ type: "wake" });
+  } catch (error) {
+    console.error("Audio capture error:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -689,6 +781,20 @@ app.get("/health", async (_req, res) => {
   }
 });
 
+// Multer error handling (file too large, wrong type)
+app.use((err, _req, res, _next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({ error: "File too large (max 25MB)" });
+    }
+    return res.status(400).json({ error: err.message });
+  }
+  if (err.message?.startsWith("Unsupported audio type")) {
+    return res.status(415).json({ error: err.message });
+  }
+  res.status(500).json({ error: err.message });
+});
+
 // ============================================================
 // Server Start + Graceful Shutdown
 // ============================================================
@@ -702,6 +808,7 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `Ollama: ${OLLAMA_URL} (embed: ${EMBED_MODEL}, chat: ${CHAT_MODEL})`,
   );
+  console.log(`Whisper: ${WHISPER_URL}`);
   console.log("[Main] Processing offloaded to worker thread");
 });
 
