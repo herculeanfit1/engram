@@ -2,7 +2,7 @@
 
 This document details the implementation plan for five enhancements to Engram, ordered by dependency so earlier features unblock later ones.
 
-> **Validated 2026-03-27 by HerculeanAgents** against the actual Engram codebase at `~/dev/engram`.
+> **Validated 2026-03-27 by HerculeanInfra** against the actual Engram codebase at `~/dev/engram`.
 > Current schema: migrations 001–004, `match_thoughts` has `filter JSONB` param (unused by HTTP layer),
 > `updated_at` column + trigger exist from 001, `content_hash` from 004. No `deleted_at`, no PATCH/DELETE routes,
 > MCP exposes 4 tools (search, capture, stats, health). All assumptions in this plan confirmed accurate.
@@ -141,7 +141,7 @@ There is currently no way to remove or correct a thought after capture. This blo
 
 **Migration: `migrations/005_add_soft_delete.sql`**
 
-> **Note:** Engram migrations are 001–004. This is Engram's 005, distinct from HerculeanAgents/Olympus `migrations/005_seed_agents_from_registry.sql` (different repo, different database).
+> **Note:** Engram migrations are 001–004. This is Engram's 005, distinct from HerculeanInfra/Olympus `migrations/005_seed_agents_from_registry.sql` (different repo, different database).
 
 ```sql
 ALTER TABLE thoughts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
