@@ -28,10 +28,7 @@ function loadConfig(): Config {
     for (const entry of keysRaw.split(",")) {
       const sep = entry.indexOf(":");
       if (sep > 0) {
-        mcpApiKeys.set(
-          entry.substring(0, sep).trim(),
-          entry.substring(sep + 1).trim(),
-        );
+        mcpApiKeys.set(entry.substring(0, sep).trim(), entry.substring(sep + 1).trim());
       }
     }
   }
@@ -58,8 +55,6 @@ export function validateConfig(): void {
   console.error(`[Config] Engram URL: ${cfg.engramUrl}`);
   if (cfg.transport === "http") {
     console.error(`[Config] Port: ${cfg.port}`);
-    console.error(
-      `[Config] API Keys: ${[...cfg.mcpApiKeys.keys()].join(", ")}`,
-    );
+    console.error(`[Config] API Keys: ${[...cfg.mcpApiKeys.keys()].join(", ")}`);
   }
 }

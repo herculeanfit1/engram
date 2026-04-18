@@ -35,19 +35,12 @@ class AuditLogger {
       eventType: "server",
       action: "startup",
       success: true,
-      message: port
-        ? `HTTP server started on port ${port}`
-        : "Stdio server started",
+      message: port ? `HTTP server started on port ${port}` : "Stdio server started",
       details,
     });
   }
 
-  toolCall(
-    toolName: string,
-    success: boolean,
-    durationMs?: number,
-    error?: string,
-  ): void {
+  toolCall(toolName: string, success: boolean, durationMs?: number, error?: string): void {
     this.log({
       timestamp: new Date().toISOString(),
       level: success ? "info" : "error",

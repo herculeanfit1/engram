@@ -8,3 +8,4 @@ node_modules/
 .envrc
 .mcp.json
 .DS_Store
+*.log

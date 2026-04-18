@@ -74,10 +74,7 @@ export interface UpdateResult {
   updated_at: string;
 }
 
-async function engramFetch(
-  path: string,
-  options?: RequestInit,
-): Promise<Response> {
+async function engramFetch(path: string, options?: RequestInit): Promise<Response> {
   const { engramUrl } = getConfig();
   const url = `${engramUrl}${path}`;
   const res = await fetch(url, options);

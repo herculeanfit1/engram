@@ -11,26 +11,17 @@ export function registerMemoryTools(server: McpServer): void {
     "Search semantic memory for relevant thoughts, facts, preferences, and context. Use this to recall information before answering questions about the user.",
     {
       query: z.string().describe("Natural language search query"),
-      limit: z
-        .number()
-        .min(1)
-        .max(50)
-        .default(10)
-        .describe("Max results to return"),
+      limit: z.number().min(1).max(50).default(10).describe("Max results to return"),
       threshold: z
         .number()
         .min(0)
         .max(1)
         .default(0.3)
-        .describe(
-          "Similarity threshold (0.3 recommended, lower = more results)",
-        ),
+        .describe("Similarity threshold (0.3 recommended, lower = more results)"),
       filter: z
         .record(z.unknown())
         .optional()
-        .describe(
-          'JSONB metadata filter (e.g. {"type": "decision"}, {"people": ["Alice"]})',
-        ),
+        .describe('JSONB metadata filter (e.g. {"type": "decision"}, {"people": ["Alice"]})'),
       type: z
         .string()
         .optional()
@@ -40,32 +31,17 @@ export function registerMemoryTools(server: McpServer): void {
       after: z
         .string()
         .optional()
-        .describe(
-          "ISO 8601 date — only return thoughts created after this date",
-        ),
+        .describe("ISO 8601 date — only return thoughts created after this date"),
       before: z
         .string()
         .optional()
-        .describe(
-          "ISO 8601 date — only return thoughts created before this date",
-        ),
+        .describe("ISO 8601 date — only return thoughts created before this date"),
       cursor: z
         .string()
         .optional()
-        .describe(
-          "Pagination cursor from a previous search response's next_cursor field",
-        ),
+        .describe("Pagination cursor from a previous search response's next_cursor field"),
     },
-    async ({
-      query,
-      limit,
-      threshold,
-      filter,
-      type,
-      after,
-      before,
-      cursor,
-    }) => {
+    async ({ query, limit, threshold, filter, type, after, before, cursor }) => {
       const t0 = Date.now();
       try {
         const data = await engram.search(
@@ -96,31 +72,21 @@ export function registerMemoryTools(server: McpServer): void {
           const sim = (r.similarity * 100).toFixed(1);
           const meta = r.metadata;
           const type = r.thought_type || (meta?.type as string) || "unknown";
-          const topics = Array.isArray(meta?.topics)
-            ? (meta.topics as string[]).join(", ")
-            : "";
-          const date = r.created_at
-            ? new Date(r.created_at).toLocaleDateString()
-            : "";
+          const topics = Array.isArray(meta?.topics) ? (meta.topics as string[]).join(", ") : "";
+          const date = r.created_at ? new Date(r.created_at).toLocaleDateString() : "";
 
-          const parts = [
-            `### ${i + 1}. [${sim}% match] ${type}${date ? ` — ${date}` : ""}`,
-          ];
+          const parts = [`### ${i + 1}. [${sim}% match] ${type}${date ? ` — ${date}` : ""}`];
 
           // For chunks, show chunk info and parent summary
           if (r.thought_type === "transcript_chunk") {
             parts.push(`*Chunk ${r.chunk_index}/${r.total_chunks}*`);
             parts.push(r.content);
             if (r.parent_transcript?.summary) {
-              parts.push(
-                `\n**Transcript summary:** ${r.parent_transcript.summary}`,
-              );
+              parts.push(`\n**Transcript summary:** ${r.parent_transcript.summary}`);
             }
           } else if (r.thought_type === "transcript_master" && r.summary) {
             parts.push(`**Summary:** ${r.summary}`);
-            parts.push(
-              `*Full transcript: ${r.total_chunks} chunks, ${r.content.length} chars*`,
-            );
+            parts.push(`*Full transcript: ${r.total_chunks} chunks, ${r.content.length} chars*`);
           } else {
             parts.push(r.content);
           }
@@ -156,9 +122,7 @@ export function registerMemoryTools(server: McpServer): void {
       source: z
         .string()
         .optional()
-        .describe(
-          'Source identifier (e.g. "claude-desktop", "conversation", "signal")',
-        ),
+        .describe('Source identifier (e.g. "claude-desktop", "conversation", "signal")'),
       metadata: z
         .record(z.unknown())
         .optional()
@@ -262,23 +226,14 @@ export function registerMemoryTools(server: McpServer): void {
         if (data.master.summary) {
           parts.push(`**Summary:** ${data.master.summary}\n`);
         }
-        parts.push(
-          `*${data.chunks.length} chunks, ${data.master.content.length} chars total*\n`,
-        );
+        parts.push(`*${data.chunks.length} chunks, ${data.master.content.length} chars total*\n`);
         for (const chunk of data.chunks) {
-          parts.push(
-            `### Chunk ${chunk.chunk_index}/${data.chunks.length}\n${chunk.content}`,
-          );
+          parts.push(`### Chunk ${chunk.chunk_index}/${data.chunks.length}\n${chunk.content}`);
         }
 
         return { content: [{ type: "text" as const, text: parts.join("\n") }] };
       } catch (error) {
-        audit.toolCall(
-          "engram_transcript",
-          false,
-          Date.now() - t0,
-          String(error),
-        );
+        audit.toolCall("engram_transcript", false, Date.now() - t0, String(error));
         return handleToolError(error);
       }
     },
@@ -369,9 +324,7 @@ export function registerMemoryTools(server: McpServer): void {
     "Update metadata on an existing thought. Merges with existing metadata — unmentioned keys are preserved. Content cannot be changed (capture a new thought instead).",
     {
       id: z.string().uuid().describe("The thought ID to update"),
-      metadata: z
-        .record(z.unknown())
-        .describe("Metadata fields to add or overwrite"),
+      metadata: z.record(z.unknown()).describe("Metadata fields to add or overwrite"),
     },
     async ({ id, metadata }) => {
       const t0 = Date.now();

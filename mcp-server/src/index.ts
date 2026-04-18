@@ -88,9 +88,7 @@ async function runHTTP(): Promise<void> {
       transport: "http",
       apiKeysConfigured: config.mcpApiKeys.size,
     });
-    console.error(
-      `engram-mcp-server listening on http://localhost:${config.port}/mcp`,
-    );
+    console.error(`engram-mcp-server listening on http://localhost:${config.port}/mcp`);
   });
 }
 

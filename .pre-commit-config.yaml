@@ -1,13 +1,15 @@
 repos:
-  - repo: local
+  - repo: https://github.com/biomejs/pre-commit
+    rev: "v2.4.12"
     hooks:
       - id: biome-check
-        name: Biome check
-        entry: npx @biomejs/biome check --write
-        language: system
-        types_or: [javascript, jsx, typescript, tsx, json]
+        additional_dependencies: ["@biomejs/biome@2.4.12"]
+
+  - repo: local
+    hooks:
       - id: no-dot-env
         name: Block .env commits
-        entry: bash -c 'echo "BLOCKED: .env files cannot be committed" && exit 1'
+        entry: >
+          bash -c 'for f in "$@"; do case "$f" in .env|.env.local|.env.bak|.env.backup) echo "BLOCKED: $f"; exit 1;; esac; done' --
         language: system
-        files: '(^|/)\.env(\.local|\.bak|\.backup)?$'
+        files: '\.env'
