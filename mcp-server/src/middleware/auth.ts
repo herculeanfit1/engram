@@ -14,10 +14,7 @@ function timingSafeEqual(a: string, b: string): boolean {
 }
 
 // Check all keys in constant time (prevents learning partial matches)
-function matchApiKey(
-  provided: string,
-  keys: Map<string, string>,
-): string | null {
+function matchApiKey(provided: string, keys: Map<string, string>): string | null {
   let matched: string | null = null;
   for (const [label, key] of keys) {
     if (timingSafeEqual(provided, key)) {
@@ -27,19 +24,13 @@ function matchApiKey(
   return matched;
 }
 
-export function apiKeyAuth(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): void {
+export function apiKeyAuth(req: Request, res: Response, next: NextFunction): void {
   const config = getConfig();
 
   const provided = req.headers["x-api-key"];
   if (!provided) {
     audit.accessDenied(req.path, "Missing X-API-Key header", req.ip);
-    res
-      .status(401)
-      .json({ error: "Unauthorized", message: "Missing X-API-Key header" });
+    res.status(401).json({ error: "Unauthorized", message: "Missing X-API-Key header" });
     return;
   }
 

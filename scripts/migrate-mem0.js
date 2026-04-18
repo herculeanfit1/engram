@@ -21,8 +21,7 @@ const DRY_RUN = process.argv.includes("--dry-run");
 
 async function fetchMem0Memories() {
   const res = await fetch(`${MEM0_URL}/api/v1/memories/?user_id=${MEM0_USER}`);
-  if (!res.ok)
-    throw new Error(`mem0 API returned ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`mem0 API returned ${res.status}: ${await res.text()}`);
   const data = await res.json();
   return data.items || [];
 }
@@ -37,9 +36,7 @@ function transformMemory(mem) {
       mem0_state: mem.state,
       mem0_app: mem.app_name || "openmemory",
       mem0_categories: mem.categories || [],
-      mem0_created_at: mem.created_at
-        ? new Date(mem.created_at * 1000).toISOString()
-        : null,
+      mem0_created_at: mem.created_at ? new Date(mem.created_at * 1000).toISOString() : null,
       ...(mem.metadata_ && Object.keys(mem.metadata_).length > 0
         ? { mem0_metadata: mem.metadata_ }
         : {}),
@@ -129,9 +126,7 @@ async function main() {
   console.log();
   if (!DRY_RUN) {
     const postStats = await (await fetch(`${ENGRAM_URL}/stats`)).json();
-    console.log(
-      `Post-migration: ${postStats.total_thoughts} thoughts in Engram`,
-    );
+    console.log(`Post-migration: ${postStats.total_thoughts} thoughts in Engram`);
   }
 
   console.log(`\n=== Migration Complete ===`);

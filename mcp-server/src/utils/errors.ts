@@ -2,10 +2,7 @@
 export function sanitizeError(error: unknown): string {
   if (error instanceof Error) {
     return error.message
-      .replace(
-        /Bearer [A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+/g,
-        "Bearer [REDACTED]",
-      )
+      .replace(/Bearer [A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+/g, "Bearer [REDACTED]")
       .replace(/token=[^&\s]+/g, "token=[REDACTED]")
       .replace(/password=[^&\s]+/g, "password=[REDACTED]")
       .replace(/X-API-Key:\s*\S+/gi, "X-API-Key: [REDACTED]");

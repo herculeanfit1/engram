@@ -68,8 +68,7 @@ function contentHash(text) {
 
 async function transcribeAudio(audioPath) {
   if (!WHISPER_URL) throw new Error("WHISPER_URL not configured");
-  if (!fs.existsSync(audioPath))
-    throw new Error(`Audio file not found: ${audioPath}`);
+  if (!fs.existsSync(audioPath)) throw new Error(`Audio file not found: ${audioPath}`);
 
   const fileBuffer = fs.readFileSync(audioPath);
   const filename = audioPath.split("/").pop();
@@ -99,9 +98,7 @@ async function transcribeAudio(audioPath) {
 
   if (!resp.ok) {
     const errBody = await resp.text().catch(() => "");
-    throw new Error(
-      `Whisper returned ${resp.status}: ${errBody.substring(0, 300)}`,
-    );
+    throw new Error(`Whisper returned ${resp.status}: ${errBody.substring(0, 300)}`);
   }
 
   const data = await resp.json();
@@ -127,9 +124,7 @@ async function generateEmbedding(text) {
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(
-      `Ollama embeddings API returned ${response.status}: ${body}`,
-    );
+    throw new Error(`Ollama embeddings API returned ${response.status}: ${body}`);
   }
 
   const data = await response.json();
@@ -161,18 +156,14 @@ JSON only, no explanation:`;
     });
 
     if (!response.ok) {
-      console.warn(
-        `LLM API returned ${response.status}, using fallback metadata`,
-      );
+      console.warn(`LLM API returned ${response.status}, using fallback metadata`);
       return { type: "unknown", topics: [], people: [], action_items: [] };
     }
 
     const data = await response.json();
     let jsonText = data.response.trim();
     if (jsonText.startsWith("```")) {
-      jsonText = jsonText
-        .replace(/^```(?:json)?\s*/, "")
-        .replace(/```\s*$/, "");
+      jsonText = jsonText.replace(/^```(?:json)?\s*/, "").replace(/```\s*$/, "");
     }
     return JSON.parse(jsonText);
   } catch (error) {
@@ -200,10 +191,7 @@ function chunkText(text, chunkSize = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
         while (idx >= 0) {
           const absPos = searchStart + idx + pattern.length;
           if (absPos > start && absPos <= searchEnd) {
-            if (
-              bestBreak === -1 ||
-              Math.abs(absPos - end) < Math.abs(bestBreak - end)
-            ) {
+            if (bestBreak === -1 || Math.abs(absPos - end) < Math.abs(bestBreak - end)) {
               bestBreak = absPos;
             }
           }
@@ -258,9 +246,7 @@ Summary:`;
     });
 
     if (!response.ok) {
-      console.warn(
-        `[Chunk] Summary LLM returned ${response.status}, skipping summary`,
-      );
+      console.warn(`[Chunk] Summary LLM returned ${response.status}, skipping summary`);
       return null;
     }
 
@@ -334,18 +320,14 @@ async function dispatchActionItems(thoughtId, metadata, contentPreview) {
            WHERE id = $2`,
           [task.id, logId],
         );
-        console.log(
-          `[Dispatch] Task created: "${item.substring(0, 60)}" -> ${task.id}`,
-        );
+        console.log(`[Dispatch] Task created: "${item.substring(0, 60)}" -> ${task.id}`);
       } else {
         const errBody = await resp.text().catch(() => "");
         await pool.query(
           `UPDATE task_dispatch_log SET status = 'failed', last_error = $1 WHERE id = $2`,
           [`HTTP ${resp.status}: ${errBody.substring(0, 200)}`, logId],
         );
-        console.warn(
-          `[Dispatch] Failed (${resp.status}): ${item.substring(0, 60)}`,
-        );
+        console.warn(`[Dispatch] Failed (${resp.status}): ${item.substring(0, 60)}`);
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : "Unknown error";
@@ -401,8 +383,7 @@ async function forwardToOpenBrain(content, metadata) {
 
 // --- Dispatch retry sweep (every 60s) ---
 const dispatchRetryInterval = setInterval(async () => {
-  if (shuttingDown || !DISPATCH_ENABLED || !DUDEDASH_URL || !DUDEDASH_API_KEY)
-    return;
+  if (shuttingDown || !DISPATCH_ENABLED || !DUDEDASH_URL || !DUDEDASH_API_KEY) return;
   try {
     const failed = await pool.query(
       `SELECT id, action_item_text, thought_id, retry_count
@@ -414,10 +395,9 @@ const dispatchRetryInterval = setInterval(async () => {
     );
     for (const row of failed.rows) {
       try {
-        const thought = await pool.query(
-          `SELECT content FROM thoughts WHERE id = $1`,
-          [row.thought_id],
-        );
+        const thought = await pool.query(`SELECT content FROM thoughts WHERE id = $1`, [
+          row.thought_id,
+        ]);
         const preview = thought.rows[0]?.content?.substring(0, 500) || "";
 
         const resp = await fetch(`${DUDEDASH_URL}/api/tasks`, {
@@ -454,11 +434,7 @@ const dispatchRetryInterval = setInterval(async () => {
           const errBody = await resp.text().catch(() => "");
           await pool.query(
             `UPDATE task_dispatch_log SET last_error = $1, retry_count = $2 WHERE id = $3`,
-            [
-              `HTTP ${resp.status}: ${errBody.substring(0, 200)}`,
-              row.retry_count + 1,
-              row.id,
-            ],
+            [`HTTP ${resp.status}: ${errBody.substring(0, 200)}`, row.retry_count + 1, row.id],
           );
         }
       } catch (err) {
@@ -484,9 +460,7 @@ async function processLongContent(item, mergedMetadata, hash) {
   const content = item.content;
   const charCount = content.length;
 
-  console.log(
-    `[Chunk] Processing long content: ${charCount} chars, group ${groupId}`,
-  );
+  console.log(`[Chunk] Processing long content: ${charCount} chars, group ${groupId}`);
 
   // Step A: Generate summary
   const summaryT0 = Date.now();
@@ -607,15 +581,7 @@ async function processLongContent(item, mergedMetadata, hash) {
     `INSERT INTO thoughts
        (content, embedding, metadata, group_id, thought_type, total_chunks, summary, content_hash)
      VALUES ($1, $2::vector, $3, $4, 'transcript_master', $5, $6, $7) RETURNING id`,
-    [
-      content,
-      `[${masterEmbedding.join(",")}]`,
-      masterMeta,
-      groupId,
-      totalChunks,
-      summary,
-      hash,
-    ],
+    [content, `[${masterEmbedding.join(",")}]`, masterMeta, groupId, totalChunks, summary, hash],
   );
   const masterId = masterInsert.rows[0].id;
 
@@ -641,14 +607,7 @@ async function processLongContent(item, mergedMetadata, hash) {
         `INSERT INTO thoughts
            (content, embedding, metadata, group_id, thought_type, chunk_index, total_chunks)
          VALUES ($1, $2::vector, $3, $4, 'transcript_chunk', $5, $6)`,
-        [
-          chunk.text,
-          `[${emb.join(",")}]`,
-          chunkMeta,
-          groupId,
-          i + 1,
-          totalChunks,
-        ],
+        [chunk.text, `[${emb.join(",")}]`, chunkMeta, groupId, i + 1, totalChunks],
       );
     } else {
       await pool.query(
@@ -675,10 +634,7 @@ async function processLongContent(item, mergedMetadata, hash) {
 // ============================================================
 
 async function processQueueItem(item) {
-  await pool.query(
-    `UPDATE capture_queue SET status = 'processing' WHERE id = $1`,
-    [item.id],
-  );
+  await pool.query(`UPDATE capture_queue SET status = 'processing' WHERE id = $1`, [item.id]);
 
   // Audio items: transcribe first, then process the transcript
   const audioPath = item.metadata?.audio_path;
@@ -698,10 +654,11 @@ async function processQueueItem(item) {
 
     // Update queue row with transcript content and hash for dedup
     const hash = contentHash(transcript);
-    await pool.query(
-      `UPDATE capture_queue SET content = $1, content_hash = $2 WHERE id = $3`,
-      [transcript, hash, item.id],
-    );
+    await pool.query(`UPDATE capture_queue SET content = $1, content_hash = $2 WHERE id = $3`, [
+      transcript,
+      hash,
+      item.id,
+    ]);
     item.content_hash = hash;
 
     // Clean up temp audio file
@@ -792,9 +749,7 @@ async function processQueue() {
       } catch (err) {
         if (err.message === "Shutdown requested") {
           // Leave item as 'processing' — will be picked up on restart
-          console.log(
-            `[Queue] Shutdown during processing of ${item.id}, leaving as 'processing'`,
-          );
+          console.log(`[Queue] Shutdown during processing of ${item.id}, leaving as 'processing'`);
           break;
         }
 
@@ -843,9 +798,7 @@ async function processQueue() {
 parentPort.on("message", (msg) => {
   switch (msg.type) {
     case "wake":
-      processQueue().catch((err) =>
-        console.error("[Worker] Queue error:", err.message),
-      );
+      processQueue().catch((err) => console.error("[Worker] Queue error:", err.message));
       break;
     case "shutdown":
       console.log("[Worker] Shutdown signal received");
@@ -864,9 +817,7 @@ parentPort.on("message", (msg) => {
 // --- Poll loop (same 10s interval as before) ---
 const pollInterval = setInterval(() => {
   if (!shuttingDown) {
-    processQueue().catch((err) =>
-      console.error("[Worker] Queue error:", err.message),
-    );
+    processQueue().catch((err) => console.error("[Worker] Queue error:", err.message));
   }
 }, 10_000);
 
@@ -879,21 +830,15 @@ pool
   )
   .then((result) => {
     if (result.rows.length > 0) {
-      console.log(
-        `[Worker] Reset ${result.rows.length} stale 'processing' items to 'pending'`,
-      );
+      console.log(`[Worker] Reset ${result.rows.length} stale 'processing' items to 'pending'`);
     }
   })
-  .catch((err) =>
-    console.error("[Worker] Failed to reset stale items:", err.message),
-  );
+  .catch((err) => console.error("[Worker] Failed to reset stale items:", err.message));
 
 // --- Notify main thread ---
 parentPort.postMessage({ type: "ready" });
 console.log("[Worker] Processing worker started");
-console.log(
-  `[Worker] Task dispatch: ${DISPATCH_ENABLED ? "enabled" : "DISABLED"}`,
-);
+console.log(`[Worker] Task dispatch: ${DISPATCH_ENABLED ? "enabled" : "DISABLED"}`);
 console.log(
   `[Worker] Open Brain forward: ${OPENBRAIN_MCP_URL ? "enabled" : "DISABLED (no OPENBRAIN_MCP_URL)"}`,
 );

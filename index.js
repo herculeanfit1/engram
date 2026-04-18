@@ -8,8 +8,7 @@ import pg from "pg";
 
 // Temp directory for audio files awaiting transcription
 const AUDIO_TEMP_DIR = "/tmp/engram-audio";
-if (!fs.existsSync(AUDIO_TEMP_DIR))
-  fs.mkdirSync(AUDIO_TEMP_DIR, { recursive: true });
+if (!fs.existsSync(AUDIO_TEMP_DIR)) fs.mkdirSync(AUDIO_TEMP_DIR, { recursive: true });
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -37,8 +36,7 @@ function contentHash(text) {
 }
 
 // UUID validation
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function ollamaHeaders() {
   const h = { "Content-Type": "application/json" };
@@ -70,9 +68,7 @@ async function generateEmbedding(text) {
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(
-      `Ollama embeddings API returned ${response.status}: ${body}`,
-    );
+    throw new Error(`Ollama embeddings API returned ${response.status}: ${body}`);
   }
 
   const data = await response.json();
@@ -222,9 +218,7 @@ app.post("/capture", async (req, res) => {
       [content, source || null, extraMetadata || null, hash],
     );
 
-    console.log(
-      `[Queue] Enqueued: ${result.rows[0].id} (${content.length} chars)`,
-    );
+    console.log(`[Queue] Enqueued: ${result.rows[0].id} (${content.length} chars)`);
 
     res.json({
       status: "queued",
@@ -245,9 +239,7 @@ app.post("/capture", async (req, res) => {
 app.post("/capture/audio", audioUpload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
-      return res
-        .status(400)
-        .json({ error: "Audio file required (field: 'file')" });
+      return res.status(400).json({ error: "Audio file required (field: 'file')" });
     }
 
     const sizeMB = (req.file.size / (1024 * 1024)).toFixed(1);
@@ -298,8 +290,7 @@ app.post("/capture/audio", audioUpload.single("file"), async (req, res) => {
       id: result.rows[0].id,
       created_at: result.rows[0].created_at,
       audio_size_mb: parseFloat(sizeMB),
-      message:
-        "Audio accepted — transcription and processing will happen in the background",
+      message: "Audio accepted — transcription and processing will happen in the background",
     });
 
     if (worker) worker.postMessage({ type: "wake" });
@@ -380,16 +371,7 @@ app.get("/queue", async (_req, res) => {
 // GET /search - Semantic search with parent transcript surfacing
 app.get("/search", async (req, res) => {
   try {
-    const {
-      q,
-      limit = 10,
-      threshold = 0.7,
-      filter,
-      type,
-      after,
-      before,
-      cursor,
-    } = req.query;
+    const { q, limit = 10, threshold = 0.7, filter, type, after, before, cursor } = req.query;
 
     if (!q) {
       return res.status(400).json({ error: 'Query parameter "q" required' });
@@ -404,9 +386,7 @@ app.get("/search", async (req, res) => {
           parsedFilter === null ||
           Array.isArray(parsedFilter)
         ) {
-          return res
-            .status(400)
-            .json({ error: "filter must be a JSON object" });
+          return res.status(400).json({ error: "filter must be a JSON object" });
         }
       } catch {
         return res.status(400).json({ error: "Invalid JSON in filter" });
@@ -437,22 +417,16 @@ app.get("/search", async (req, res) => {
     if (cursor) {
       const colonIdx = cursor.indexOf(":");
       if (colonIdx === -1) {
-        return res
-          .status(400)
-          .json({ error: "Invalid cursor format (expected distance:uuid)" });
+        return res.status(400).json({ error: "Invalid cursor format (expected distance:uuid)" });
       }
       cursorDistance = parseFloat(cursor.slice(0, colonIdx));
       cursorId = cursor.slice(colonIdx + 1);
       if (Number.isNaN(cursorDistance) || !UUID_RE.test(cursorId)) {
-        return res
-          .status(400)
-          .json({ error: "Invalid cursor format (expected distance:uuid)" });
+        return res.status(400).json({ error: "Invalid cursor format (expected distance:uuid)" });
       }
     }
 
-    const fetchLimit = excludeType
-      ? parseInt(limit, 10) * 3
-      : parseInt(limit, 10);
+    const fetchLimit = excludeType ? parseInt(limit, 10) * 3 : parseInt(limit, 10);
 
     const embedding = await generateEmbedding(q);
 
@@ -473,9 +447,7 @@ app.get("/search", async (req, res) => {
 
     let rows = result.rows;
     if (excludeType) {
-      rows = rows
-        .filter((r) => r.thought_type !== excludeType)
-        .slice(0, parseInt(limit, 10));
+      rows = rows.filter((r) => r.thought_type !== excludeType).slice(0, parseInt(limit, 10));
     }
 
     // Collect group_ids from chunk results to fetch parent transcripts
@@ -507,11 +479,7 @@ app.get("/search", async (req, res) => {
 
     // Enrich results with parent info
     const enrichedResults = rows.map((r) => {
-      if (
-        r.thought_type === "transcript_chunk" &&
-        r.group_id &&
-        parentTranscripts[r.group_id]
-      ) {
+      if (r.thought_type === "transcript_chunk" && r.group_id && parentTranscripts[r.group_id]) {
         return {
           ...r,
           parent_transcript: parentTranscripts[r.group_id],
@@ -582,8 +550,7 @@ app.get("/transcript/:groupId", async (req, res) => {
 app.delete("/thoughts/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    if (!UUID_RE.test(id))
-      return res.status(400).json({ error: "Invalid thought ID" });
+    if (!UUID_RE.test(id)) return res.status(400).json({ error: "Invalid thought ID" });
 
     const thought = await pool.query(
       `UPDATE thoughts SET deleted_at = NOW()
@@ -624,8 +591,7 @@ app.delete("/thoughts/:id", async (req, res) => {
 app.patch("/thoughts/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    if (!UUID_RE.test(id))
-      return res.status(400).json({ error: "Invalid thought ID" });
+    if (!UUID_RE.test(id)) return res.status(400).json({ error: "Invalid thought ID" });
 
     const { metadata } = req.body;
     if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
@@ -655,8 +621,7 @@ app.patch("/thoughts/:id", async (req, res) => {
 app.post("/thoughts/:id/restore", async (req, res) => {
   try {
     const { id } = req.params;
-    if (!UUID_RE.test(id))
-      return res.status(400).json({ error: "Invalid thought ID" });
+    if (!UUID_RE.test(id)) return res.status(400).json({ error: "Invalid thought ID" });
 
     const thought = await pool.query(
       `UPDATE thoughts SET deleted_at = NULL
@@ -666,9 +631,7 @@ app.post("/thoughts/:id/restore", async (req, res) => {
     );
 
     if (thought.rows.length === 0) {
-      return res
-        .status(404)
-        .json({ error: "Thought not found or not deleted" });
+      return res.status(404).json({ error: "Thought not found or not deleted" });
     }
 
     let chunksRestored = 0;
@@ -802,12 +765,8 @@ app.use((err, _req, res, _next) => {
 const PORT = parseInt(process.env.PORT || "3700", 10);
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Engram API listening on port ${PORT}`);
-  console.log(
-    `Database: ${process.env.DB_HOST || "localhost"}/${process.env.DB_NAME || "engram"}`,
-  );
-  console.log(
-    `Ollama: ${OLLAMA_URL} (embed: ${EMBED_MODEL}, chat: ${CHAT_MODEL})`,
-  );
+  console.log(`Database: ${process.env.DB_HOST || "localhost"}/${process.env.DB_NAME || "engram"}`);
+  console.log(`Ollama: ${OLLAMA_URL} (embed: ${EMBED_MODEL}, chat: ${CHAT_MODEL})`);
   console.log(`Whisper: ${WHISPER_URL}`);
   console.log("[Main] Processing offloaded to worker thread");
 });
