@@ -7,7 +7,7 @@
   },
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "op run --env-file=.env.1p.template -- node index.js",
     "test": "vitest run"
   },
   "dependencies": {
