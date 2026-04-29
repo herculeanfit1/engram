@@ -364,10 +364,11 @@ app.post("/capture/intel", async (req, res) => {
     if (!content || content.trim().length === 0) {
       return res.status(400).json({ error: "Content (transcript) required" });
     }
-    if (!session || !session.title) {
-      return res
-        .status(400)
-        .json({ error: "session.title required (e.g. { session: { title: '...', speaker: '...', conference: '...' } })" });
+    if (!session?.title) {
+      return res.status(400).json({
+        error:
+          "session.title required (e.g. { session: { title: '...', speaker: '...', conference: '...' } })",
+      });
     }
 
     const validScopes = ["personal", "ca"];

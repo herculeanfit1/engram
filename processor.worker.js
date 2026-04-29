@@ -346,7 +346,7 @@ async function dispatchActionItems(thoughtId, metadata, contentPreview) {
 
 // --- Forward to Open Brain (Supabase) for cross-AI access ---
 
-async function forwardToOpenBrain(content, metadata) {
+async function forwardToOpenBrain(content, _metadata) {
   if (!OPENBRAIN_MCP_URL) return;
 
   try {
