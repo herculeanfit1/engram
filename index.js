@@ -107,6 +107,7 @@ function spawnWorker() {
       dispatchEnabled: process.env.DISPATCH_ENABLED !== "false",
       openbrainMcpUrl: process.env.OPENBRAIN_MCP_URL || "",
       whisperUrl: WHISPER_URL,
+      intelWebhookUrl: process.env.INTEL_WEBHOOK_URL || "",
     },
   });
 
@@ -159,11 +160,14 @@ spawnWorker();
 // POST /capture - Queue a thought for async processing
 app.post("/capture", async (req, res) => {
   try {
-    const { content, metadata: extraMetadata, source } = req.body;
+    const { content, metadata: extraMetadata, source, scope } = req.body;
 
     if (!content || content.trim().length === 0) {
       return res.status(400).json({ error: "Content required" });
     }
+
+    const validScopes = ["personal", "ca"];
+    const captureScope = validScopes.includes(scope) ? scope : "personal";
 
     const hash = contentHash(content);
 
@@ -212,10 +216,10 @@ app.post("/capture", async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO capture_queue (content, source, metadata, content_hash)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO capture_queue (content, source, metadata, content_hash, scope)
+       VALUES ($1, $2, $3, $4, $5)
        RETURNING id, created_at`,
-      [content, source || null, extraMetadata || null, hash],
+      [content, source || null, extraMetadata || null, hash, captureScope],
     );
 
     console.log(`[Queue] Enqueued: ${result.rows[0].id} (${content.length} chars)`);
@@ -255,6 +259,8 @@ app.post("/capture/audio", audioUpload.single("file"), async (req, res) => {
 
     // Build metadata
     const source = req.body?.source || "audio-transcription";
+    const validScopes = ["personal", "ca"];
+    const captureScope = validScopes.includes(req.body?.scope) ? req.body.scope : "personal";
     let extraMetadata = {};
     if (req.body?.metadata) {
       try {
@@ -271,13 +277,14 @@ app.post("/capture/audio", audioUpload.single("file"), async (req, res) => {
 
     // Insert into capture queue with placeholder content (worker will replace with transcript)
     const result = await pool.query(
-      `INSERT INTO capture_queue (content, source, metadata)
-       VALUES ($1, $2, $3)
+      `INSERT INTO capture_queue (content, source, metadata, scope)
+       VALUES ($1, $2, $3, $4)
        RETURNING id, created_at`,
       [
         `[audio pending transcription: ${req.file.originalname || "audio"}, ${sizeMB}MB]`,
         source,
         extraMetadata,
+        captureScope,
       ],
     );
 
@@ -349,6 +356,183 @@ app.post("/capture/batch", async (req, res) => {
   }
 });
 
+// POST /capture/intel - Queue a transcript for technical intel extraction
+app.post("/capture/intel", async (req, res) => {
+  try {
+    const { content, session, source, scope } = req.body;
+
+    if (!content || content.trim().length === 0) {
+      return res.status(400).json({ error: "Content (transcript) required" });
+    }
+    if (!session || !session.title) {
+      return res
+        .status(400)
+        .json({ error: "session.title required (e.g. { session: { title: '...', speaker: '...', conference: '...' } })" });
+    }
+
+    const validScopes = ["personal", "ca"];
+    const captureScope = validScopes.includes(scope) ? scope : "personal";
+    const hash = contentHash(content);
+
+    // Dedup check
+    const [existingThought, existingQueue] = await Promise.all([
+      pool.query(
+        `SELECT id, group_id, created_at FROM thoughts
+         WHERE content_hash = $1 AND thought_type = 'intel_master'
+         LIMIT 1`,
+        [hash],
+      ),
+      pool.query(
+        `SELECT id, created_at, status FROM capture_queue
+         WHERE content_hash = $1 AND status IN ('pending', 'processing')
+         LIMIT 1`,
+        [hash],
+      ),
+    ]);
+
+    if (existingThought.rows.length > 0) {
+      return res.status(409).json({
+        status: "duplicate",
+        message: "Transcript already processed",
+        existing_id: existingThought.rows[0].id,
+        group_id: existingThought.rows[0].group_id,
+      });
+    }
+    if (existingQueue.rows.length > 0) {
+      return res.status(409).json({
+        status: "duplicate",
+        message: "Transcript already queued",
+        queued_id: existingQueue.rows[0].id,
+      });
+    }
+
+    const metadata = { session, source: source || "intel-transcript" };
+
+    const result = await pool.query(
+      `INSERT INTO capture_queue (content, source, metadata, content_hash, capture_type, scope)
+       VALUES ($1, $2, $3, $4, 'intel', $5)
+       RETURNING id, created_at`,
+      [content, source || "intel-transcript", metadata, hash, captureScope],
+    );
+
+    console.log(
+      `[Intel] Queued: "${session.title}" (${content.length} chars, id ${result.rows[0].id})`,
+    );
+
+    res.json({
+      status: "queued",
+      id: result.rows[0].id,
+      created_at: result.rows[0].created_at,
+      session_title: session.title,
+      message: "Intel transcript queued for processing (gold nugget extraction + chunking)",
+    });
+
+    if (worker) worker.postMessage({ type: "wake" });
+  } catch (error) {
+    console.error("Intel capture error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /sessions - Browse intel session summaries and gold nuggets
+app.get("/sessions", async (req, res) => {
+  try {
+    const { conference, limit = 50 } = req.query;
+
+    let query = `
+      SELECT id, group_id, summary, metadata, total_chunks, created_at
+      FROM thoughts
+      WHERE thought_type = 'intel_master' AND deleted_at IS NULL
+    `;
+    const params = [];
+
+    if (conference) {
+      params.push(conference);
+      query += ` AND metadata->'session'->>'conference' ILIKE $${params.length}`;
+    }
+
+    query += ` ORDER BY created_at DESC LIMIT $${params.length + 1}`;
+    params.push(Math.min(parseInt(limit, 10) || 50, 200));
+
+    const result = await pool.query(query, params);
+
+    const sessions = result.rows.map((r) => {
+      const session = r.metadata?.session || {};
+      return {
+        id: r.id,
+        group_id: r.group_id,
+        title: session.title || "Untitled",
+        speaker: session.speaker || null,
+        conference: session.conference || null,
+        date: session.date || null,
+        track: session.track || null,
+        summary: r.summary,
+        gold_nuggets: r.metadata?.gold_nuggets || [],
+        topics: r.metadata?.topics || [],
+        action_items: r.metadata?.action_items || [],
+        total_chunks: r.total_chunks,
+        created_at: r.created_at,
+      };
+    });
+
+    res.json({ count: sessions.length, sessions });
+  } catch (error) {
+    console.error("Sessions browse error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /sessions/:groupId - Detailed intel session view
+app.get("/sessions/:groupId", async (req, res) => {
+  try {
+    const { groupId } = req.params;
+
+    const master = await pool.query(
+      `SELECT id, content, summary, metadata, total_chunks, created_at
+       FROM thoughts
+       WHERE group_id = $1 AND thought_type = 'intel_master'
+         AND deleted_at IS NULL`,
+      [groupId],
+    );
+
+    if (master.rows.length === 0) {
+      return res.status(404).json({ error: "Intel session not found" });
+    }
+
+    const row = master.rows[0];
+    const session = row.metadata?.session || {};
+
+    const chunks = await pool.query(
+      `SELECT id, content, chunk_index, metadata, created_at
+       FROM thoughts
+       WHERE group_id = $1 AND thought_type = 'intel_chunk'
+         AND deleted_at IS NULL
+       ORDER BY chunk_index`,
+      [groupId],
+    );
+
+    res.json({
+      group_id: groupId,
+      title: session.title || "Untitled",
+      speaker: session.speaker || null,
+      conference: session.conference || null,
+      date: session.date || null,
+      track: session.track || null,
+      summary: row.summary,
+      gold_nuggets: row.metadata?.gold_nuggets || [],
+      topics: row.metadata?.topics || [],
+      people: row.metadata?.people || [],
+      action_items: row.metadata?.action_items || [],
+      total_chunks: row.total_chunks,
+      created_at: row.created_at,
+      chunks: chunks.rows,
+    });
+  } catch (error) {
+    console.error("Session detail error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /queue - Queue monitoring
 app.get("/queue", async (_req, res) => {
   try {
@@ -371,7 +555,7 @@ app.get("/queue", async (_req, res) => {
 // GET /search - Semantic search with parent transcript surfacing
 app.get("/search", async (req, res) => {
   try {
-    const { q, limit = 10, threshold = 0.7, filter, type, after, before, cursor } = req.query;
+    const { q, limit = 10, threshold = 0.7, filter, type, after, before, cursor, scope = "personal" } = req.query;
 
     if (!q) {
       return res.status(400).json({ error: 'Query parameter "q" required' });
@@ -430,8 +614,11 @@ app.get("/search", async (req, res) => {
 
     const embedding = await generateEmbedding(q);
 
+    // Scope filter: 'personal' (default), 'ca', or 'all' (= NULL in SQL)
+    const filterScope = scope === "all" ? null : (scope || "personal");
+
     const result = await pool.query(
-      `SELECT * FROM match_thoughts($1::vector, $2, $3, $4::jsonb, $5, $6::timestamptz, $7::timestamptz, $8, $9)`,
+      `SELECT * FROM match_thoughts($1::vector, $2, $3, $4::jsonb, $5, $6::timestamptz, $7::timestamptz, $8, $9, $10)`,
       [
         `[${embedding.join(",")}]`,
         parseFloat(threshold),
@@ -442,6 +629,7 @@ app.get("/search", async (req, res) => {
         beforeDate ? beforeDate.toISOString() : null,
         cursorDistance,
         cursorId,
+        filterScope,
       ],
     );
 
