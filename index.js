@@ -555,7 +555,17 @@ app.get("/queue", async (_req, res) => {
 // GET /search - Semantic search with parent transcript surfacing
 app.get("/search", async (req, res) => {
   try {
-    const { q, limit = 10, threshold = 0.7, filter, type, after, before, cursor, scope = "personal" } = req.query;
+    const {
+      q,
+      limit = 10,
+      threshold = 0.7,
+      filter,
+      type,
+      after,
+      before,
+      cursor,
+      scope = "personal",
+    } = req.query;
 
     if (!q) {
       return res.status(400).json({ error: 'Query parameter "q" required' });
@@ -615,7 +625,7 @@ app.get("/search", async (req, res) => {
     const embedding = await generateEmbedding(q);
 
     // Scope filter: 'personal' (default), 'ca', or 'all' (= NULL in SQL)
-    const filterScope = scope === "all" ? null : (scope || "personal");
+    const filterScope = scope === "all" ? null : scope || "personal";
 
     const result = await pool.query(
       `SELECT * FROM match_thoughts($1::vector, $2, $3, $4::jsonb, $5, $6::timestamptz, $7::timestamptz, $8, $9, $10)`,
