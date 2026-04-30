@@ -40,6 +40,7 @@ const DUDEDASH_API_KEY = workerData.dudedashApiKey;
 const DISPATCH_ENABLED = workerData.dispatchEnabled;
 const OPENBRAIN_MCP_URL = workerData.openbrainMcpUrl;
 const WHISPER_URL = workerData.whisperUrl;
+const INTEL_WEBHOOK_URL = workerData.intelWebhookUrl;
 
 // --- Chunking config ---
 const LONG_CONTENT_THRESHOLD = 6000;
@@ -346,8 +347,14 @@ async function dispatchActionItems(thoughtId, metadata, contentPreview) {
 
 // --- Forward to Open Brain (Supabase) for cross-AI access ---
 
-async function forwardToOpenBrain(content, _metadata) {
+async function forwardToOpenBrain(content, _metadata, scope) {
   if (!OPENBRAIN_MCP_URL) return;
+
+  // Scope gate: CA content never leaves Unraid
+  if (scope === "ca") {
+    console.log(`[OpenBrain] Skipped (scope: ca): ${content.substring(0, 60)}...`);
+    return;
+  }
 
   try {
     const response = await fetch(OPENBRAIN_MCP_URL, {
@@ -579,9 +586,18 @@ async function processLongContent(item, mergedMetadata, hash) {
 
   const masterInsert = await pool.query(
     `INSERT INTO thoughts
-       (content, embedding, metadata, group_id, thought_type, total_chunks, summary, content_hash)
-     VALUES ($1, $2::vector, $3, $4, 'transcript_master', $5, $6, $7) RETURNING id`,
-    [content, `[${masterEmbedding.join(",")}]`, masterMeta, groupId, totalChunks, summary, hash],
+       (content, embedding, metadata, group_id, thought_type, total_chunks, summary, content_hash, scope)
+     VALUES ($1, $2::vector, $3, $4, 'transcript_master', $5, $6, $7, $8) RETURNING id`,
+    [
+      content,
+      `[${masterEmbedding.join(",")}]`,
+      masterMeta,
+      groupId,
+      totalChunks,
+      summary,
+      hash,
+      mergedMetadata.scope || "personal",
+    ],
   );
   const masterId = masterInsert.rows[0].id;
 
@@ -589,7 +605,7 @@ async function processLongContent(item, mergedMetadata, hash) {
   await dispatchActionItems(masterId, masterMeta, content.substring(0, 500));
 
   // Forward full content to Open Brain (it handles its own chunking)
-  await forwardToOpenBrain(content, masterMeta);
+  await forwardToOpenBrain(content, masterMeta, mergedMetadata.scope);
 
   // Chunk thoughts
   for (let i = 0; i < chunks.length; i++) {
@@ -602,19 +618,20 @@ async function processLongContent(item, mergedMetadata, hash) {
       parent_group_id: groupId,
     };
 
+    const chunkScope = mergedMetadata.scope || "personal";
     if (emb) {
       await pool.query(
         `INSERT INTO thoughts
-           (content, embedding, metadata, group_id, thought_type, chunk_index, total_chunks)
-         VALUES ($1, $2::vector, $3, $4, 'transcript_chunk', $5, $6)`,
-        [chunk.text, `[${emb.join(",")}]`, chunkMeta, groupId, i + 1, totalChunks],
+           (content, embedding, metadata, group_id, thought_type, chunk_index, total_chunks, scope)
+         VALUES ($1, $2::vector, $3, $4, 'transcript_chunk', $5, $6, $7)`,
+        [chunk.text, `[${emb.join(",")}]`, chunkMeta, groupId, i + 1, totalChunks, chunkScope],
       );
     } else {
       await pool.query(
         `INSERT INTO thoughts
-           (content, metadata, group_id, thought_type, chunk_index, total_chunks)
-         VALUES ($1, $2, $3, 'transcript_chunk', $4, $5)`,
-        [chunk.text, chunkMeta, groupId, i + 1, totalChunks],
+           (content, metadata, group_id, thought_type, chunk_index, total_chunks, scope)
+         VALUES ($1, $2, $3, 'transcript_chunk', $4, $5, $6)`,
+        [chunk.text, chunkMeta, groupId, i + 1, totalChunks, chunkScope],
       );
     }
   }
@@ -627,6 +644,344 @@ async function processLongContent(item, mergedMetadata, hash) {
   );
 
   return { groupId, totalChunks, summaryGenerated: !!summary };
+}
+
+// ============================================================
+// Intel Session Processing
+// ============================================================
+
+async function extractIntelInsights(text, session) {
+  const prompt = `You are a technical analyst extracting EVERY useful insight from a session transcript. Be exhaustive — capture all technical tidbits, not just the highlights.
+
+Session: "${session.title}" by ${session.speaker || "unknown"}${session.conference ? ` at ${session.conference}` : ""}
+
+Produce JSON with these keys:
+
+- "summary": Session summary (200-400 words). The speaker's thesis, key arguments, and conclusions.
+
+- "gold_nuggets": Array of ALL technical insights worth remembering. No minimum or maximum — extract everything that qualifies. Each nugget: { "insight": "1-2 sentence takeaway with enough context to be useful standalone", "category": one of "tool|framework|technique|architecture|tip|metric|resource|pattern|gotcha|quote", "actionable": true if this can be applied to current work, "related_tools": ["specific tool/product names"] }
+
+  What qualifies as a nugget:
+  * Tools, products, or services mentioned with WHY they were chosen
+  * Techniques, patterns, or workflows described
+  * Architecture decisions and their trade-offs
+  * Practical tips, tricks, shortcuts, or CLI flags
+  * Gotchas, pitfalls, or "we learned the hard way" warnings
+  * Metrics, benchmarks, thresholds, or sizing guidance
+  * Configuration values or settings that matter
+  * Resources, repos, docs, or references cited
+  * Quotes that capture a key principle
+  * Comparisons between tools or approaches
+  * Migration paths or upgrade strategies mentioned
+
+- "people": Array of all names mentioned (including the speaker)
+- "action_items": Array of things to research, try, implement, or follow up on
+- "topics": Array of 5-10 technical topic tags
+- "tools_mentioned": Array of every specific tool, product, framework, or library named
+
+Transcript:
+${text.substring(0, 12000)}
+
+JSON only, no explanation:`;
+
+  try {
+    const response = await fetch(`${OLLAMA_URL}/api/generate`, {
+      method: "POST",
+      headers: ollamaHeaders(),
+      body: JSON.stringify({
+        model: CHAT_MODEL,
+        prompt,
+        stream: false,
+        options: { temperature: 0.3, num_predict: 4000 },
+      }),
+      signal: AbortSignal.timeout(SUMMARY_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      console.warn(`[Intel] LLM returned ${response.status}, using fallback`);
+      return null;
+    }
+
+    const data = await response.json();
+    let jsonText = data.response.trim();
+    if (jsonText.startsWith("```")) {
+      jsonText = jsonText.replace(/^```(?:json)?\s*/, "").replace(/```\s*$/, "");
+    }
+    return JSON.parse(jsonText);
+  } catch (error) {
+    console.warn("[Intel] Insight extraction failed:", error.message);
+    return null;
+  }
+}
+
+async function forwardNuggetsToOpenBrain(nuggets, session) {
+  if (!OPENBRAIN_MCP_URL || !nuggets || nuggets.length === 0) return;
+
+  const prefix = `[${session.conference || "Session"}${session.speaker ? ` / ${session.speaker}` : ""}]`;
+  const items = nuggets.map((n) => {
+    const category = n.category
+      ? `${n.category[0].toUpperCase()}${n.category.slice(1)} insight`
+      : "Insight";
+    const tools =
+      Array.isArray(n.related_tools) && n.related_tools.length
+        ? ` (tools: ${n.related_tools.join(", ")})`
+        : "";
+    return `${prefix} ${category}: ${n.insight}${tools}`;
+  });
+
+  try {
+    const response = await fetch(OPENBRAIN_MCP_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "capture_thoughts",
+          arguments: {
+            items,
+            source: "engram-intel",
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(OPENBRAIN_TIMEOUT_MS * 3), // longer for bulk
+    });
+
+    if (response.ok) {
+      console.log(`[OpenBrain] Forwarded ${items.length} gold nuggets from "${session.title}"`);
+    } else {
+      console.warn(`[OpenBrain] Nugget forward failed: ${response.status}`);
+    }
+  } catch (err) {
+    console.warn(`[OpenBrain] Nugget forward error: ${err.message}`);
+  }
+}
+
+async function processIntelSession(item, mergedMetadata, hash) {
+  const t0 = Date.now();
+  const groupId = crypto.randomUUID();
+  const content = item.content;
+  const charCount = content.length;
+  const session = item.metadata?.session || {};
+  const scope = mergedMetadata.scope || "personal";
+
+  console.log(
+    `[Intel] Processing: "${session.title || "untitled"}" (${charCount} chars, group ${groupId})`,
+  );
+
+  // Step A: Extract intel insights (summary + gold nuggets)
+  parentPort.postMessage({
+    type: "log",
+    level: "info",
+    message: `[Intel] Extracting insights for "${session.title}"...`,
+  });
+  const insights = await extractIntelInsights(content, session);
+  if (shuttingDown) throw new Error("Shutdown requested");
+
+  const summary = insights?.summary || null;
+  const goldNuggets = Array.isArray(insights?.gold_nuggets) ? insights.gold_nuggets : [];
+  const extractedMeta = {
+    type: "intel_session",
+    topics: insights?.topics || [],
+    people: insights?.people || [],
+    action_items: insights?.action_items || [],
+    tools_mentioned: insights?.tools_mentioned || [],
+  };
+
+  parentPort.postMessage({
+    type: "log",
+    level: "info",
+    message: `[Intel] Extracted: ${goldNuggets.length} nuggets, ${summary ? summary.length : 0} char summary`,
+  });
+
+  // Step B: Chunk the transcript
+  const chunks = chunkText(content);
+  const totalChunks = chunks.length;
+
+  // Step C: Generate embeddings
+  const embedT0 = Date.now();
+  const masterEmbedText = summary || chunks[0].text;
+  const masterEmbedding = await generateEmbedding(masterEmbedText);
+  if (shuttingDown) throw new Error("Shutdown requested");
+
+  const chunkEmbeddings = [];
+  for (let i = 0; i < chunks.length; i++) {
+    try {
+      if (i % 5 === 0)
+        parentPort.postMessage({
+          type: "log",
+          level: "info",
+          message: `[Intel] Embedding chunk ${i + 1}/${totalChunks}...`,
+        });
+      const emb = await generateEmbedding(chunks[i].text);
+      chunkEmbeddings.push(emb);
+    } catch (err) {
+      parentPort.postMessage({
+        type: "log",
+        level: "error",
+        message: `[Intel] Embedding failed chunk ${i + 1}: ${err.message}`,
+      });
+      chunkEmbeddings.push(null);
+    }
+    if (shuttingDown) throw new Error("Shutdown requested");
+  }
+
+  const embedMs = Date.now() - embedT0;
+  console.log(`[Intel] Embeddings: ${totalChunks} chunks (${embedMs}ms)`);
+
+  // Step C2: Map nuggets to source chunks via embedding similarity
+  if (goldNuggets.length > 0 && chunkEmbeddings.some((e) => e !== null)) {
+    const mapT0 = Date.now();
+    for (const nugget of goldNuggets) {
+      try {
+        const nuggetEmb = await generateEmbedding(nugget.insight || JSON.stringify(nugget));
+        let bestIdx = -1;
+        let bestSim = -1;
+        for (let ci = 0; ci < chunkEmbeddings.length; ci++) {
+          const ce = chunkEmbeddings[ci];
+          if (!ce) continue;
+          let dot = 0;
+          let normA = 0;
+          let normB = 0;
+          for (let d = 0; d < nuggetEmb.length; d++) {
+            dot += nuggetEmb[d] * ce[d];
+            normA += nuggetEmb[d] * nuggetEmb[d];
+            normB += ce[d] * ce[d];
+          }
+          const sim = dot / (Math.sqrt(normA) * Math.sqrt(normB));
+          if (sim > bestSim) {
+            bestSim = sim;
+            bestIdx = ci;
+          }
+        }
+        if (bestIdx >= 0) {
+          nugget.source_chunk = bestIdx + 1; // 1-indexed to match chunk_index
+          nugget.source_similarity = Math.round(bestSim * 1000) / 1000;
+        }
+      } catch (err) {
+        // Non-fatal — nugget just won't have a source_chunk
+        console.warn(`[Intel] Nugget mapping failed: ${err.message}`);
+      }
+      if (shuttingDown) throw new Error("Shutdown requested");
+    }
+    console.log(
+      `[Intel] Nugget mapping: ${goldNuggets.filter((n) => n.source_chunk).length}/${goldNuggets.length} mapped (${Date.now() - mapT0}ms)`,
+    );
+  }
+
+  // Step D: Build master metadata
+  const masterMeta = {
+    ...extractedMeta,
+    ...mergedMetadata,
+    session,
+    gold_nuggets: goldNuggets,
+    char_count: charCount,
+    chunk_size: CHUNK_SIZE,
+    overlap: CHUNK_OVERLAP,
+    model_embedding: EMBED_MODEL,
+    model_summary: CHAT_MODEL,
+  };
+
+  // Step E: Store in database
+  const dbT0 = Date.now();
+
+  const masterInsert = await pool.query(
+    `INSERT INTO thoughts
+       (content, embedding, metadata, group_id, thought_type, total_chunks, summary, content_hash, scope)
+     VALUES ($1, $2::vector, $3, $4, 'intel_master', $5, $6, $7, $8) RETURNING id`,
+    [
+      content,
+      `[${masterEmbedding.join(",")}]`,
+      masterMeta,
+      groupId,
+      totalChunks,
+      summary,
+      hash,
+      scope,
+    ],
+  );
+  const masterId = masterInsert.rows[0].id;
+
+  // Chunk thoughts
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    const emb = chunkEmbeddings[i];
+    const chunkMeta = {
+      ...mergedMetadata,
+      session: { title: session.title, speaker: session.speaker, conference: session.conference },
+      char_start: chunk.charStart,
+      char_end: chunk.charEnd,
+      parent_group_id: groupId,
+    };
+
+    if (emb) {
+      await pool.query(
+        `INSERT INTO thoughts
+           (content, embedding, metadata, group_id, thought_type, chunk_index, total_chunks, scope)
+         VALUES ($1, $2::vector, $3, $4, 'intel_chunk', $5, $6, $7)`,
+        [chunk.text, `[${emb.join(",")}]`, chunkMeta, groupId, i + 1, totalChunks, scope],
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO thoughts
+           (content, metadata, group_id, thought_type, chunk_index, total_chunks, scope)
+         VALUES ($1, $2, $3, 'intel_chunk', $4, $5, $6)`,
+        [chunk.text, chunkMeta, groupId, i + 1, totalChunks, scope],
+      );
+    }
+  }
+
+  const dbMs = Date.now() - dbT0;
+
+  // Step F: Dispatch action items
+  await dispatchActionItems(masterId, masterMeta, content.substring(0, 500));
+
+  // Step G: Forward gold nuggets to Open Brain (not the raw transcript)
+  if (scope !== "ca") {
+    await forwardNuggetsToOpenBrain(goldNuggets, session);
+  }
+
+  // Step H: Fire n8n webhook for email delivery
+  if (INTEL_WEBHOOK_URL) {
+    try {
+      const webhookPayload = {
+        session,
+        summary,
+        gold_nuggets: goldNuggets,
+        action_items: extractedMeta.action_items,
+        topics: extractedMeta.topics,
+        tools_mentioned: extractedMeta.tools_mentioned,
+        people: extractedMeta.people,
+        group_id: groupId,
+        total_chunks: totalChunks,
+        processed_at: new Date().toISOString(),
+      };
+      const webhookResp = await fetch(INTEL_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(webhookPayload),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (webhookResp.ok) {
+        console.log(`[Intel] Webhook fired for "${session.title}"`);
+      } else {
+        console.warn(`[Intel] Webhook failed: ${webhookResp.status}`);
+      }
+    } catch (err) {
+      console.warn(`[Intel] Webhook error: ${err.message}`);
+    }
+  }
+
+  const totalMs = Date.now() - t0;
+  console.log(
+    `[Intel] Stored: "${session.title}" — 1 master + ${totalChunks} chunks, ${goldNuggets.length} nuggets (db: ${dbMs}ms, total: ${totalMs}ms)`,
+  );
+
+  return { groupId, totalChunks, goldNuggets: goldNuggets.length, summaryGenerated: !!summary };
 }
 
 // ============================================================
@@ -676,9 +1031,14 @@ async function processQueueItem(item) {
 
   const isLong = item.content.length > LONG_CONTENT_THRESHOLD;
   const hash = item.content_hash || contentHash(item.content);
+  const scope = item.scope || "personal";
 
-  if (isLong) {
-    const mergedMetadata = { ...(item.metadata || {}) };
+  if (item.capture_type === "intel") {
+    const mergedMetadata = { ...(item.metadata || {}), scope };
+    if (item.source) mergedMetadata.source = item.source;
+    await processIntelSession(item, mergedMetadata, hash);
+  } else if (isLong) {
+    const mergedMetadata = { ...(item.metadata || {}), scope };
     if (item.source) mergedMetadata.source = item.source;
     await processLongContent(item, mergedMetadata, hash);
   } else {
@@ -688,18 +1048,18 @@ async function processQueueItem(item) {
     ]);
     if (shuttingDown) throw new Error("Shutdown requested");
 
-    const mergedMetadata = { ...metadata, ...(item.metadata || {}) };
+    const mergedMetadata = { ...metadata, ...(item.metadata || {}), scope };
     if (item.source) mergedMetadata.source = item.source;
 
     const insertResult = await pool.query(
-      `INSERT INTO thoughts (content, embedding, metadata, content_hash)
-       VALUES ($1, $2::vector, $3, $4) RETURNING id`,
-      [item.content, `[${embedding.join(",")}]`, mergedMetadata, hash],
+      `INSERT INTO thoughts (content, embedding, metadata, content_hash, scope)
+       VALUES ($1, $2::vector, $3, $4, $5) RETURNING id`,
+      [item.content, `[${embedding.join(",")}]`, mergedMetadata, hash, scope],
     );
     const thoughtId = insertResult.rows[0].id;
 
     await dispatchActionItems(thoughtId, mergedMetadata, item.content);
-    await forwardToOpenBrain(item.content, mergedMetadata);
+    await forwardToOpenBrain(item.content, mergedMetadata, mergedMetadata.scope);
   }
 
   await pool.query(
@@ -841,6 +1201,9 @@ console.log("[Worker] Processing worker started");
 console.log(`[Worker] Task dispatch: ${DISPATCH_ENABLED ? "enabled" : "DISABLED"}`);
 console.log(
   `[Worker] Open Brain forward: ${OPENBRAIN_MCP_URL ? "enabled" : "DISABLED (no OPENBRAIN_MCP_URL)"}`,
+);
+console.log(
+  `[Worker] Intel webhook: ${INTEL_WEBHOOK_URL ? "enabled" : "DISABLED (no INTEL_WEBHOOK_URL)"}`,
 );
 
 // --- Clean exit ---
