@@ -364,6 +364,11 @@ app.post("/capture/intel", async (req, res) => {
     if (!content || content.trim().length === 0) {
       return res.status(400).json({ error: "Content (transcript) required" });
     }
+    if (content.trim().length < 500) {
+      return res.status(400).json({
+        error: "Transcript too short (minimum 500 characters). Did you paste the full transcript?",
+      });
+    }
     if (!session?.title) {
       return res.status(400).json({
         error:
@@ -530,6 +535,69 @@ app.get("/sessions/:groupId", async (req, res) => {
     });
   } catch (error) {
     console.error("Session detail error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /sessions/:groupId/report - Comprehensive intel report with inline source text
+app.get("/sessions/:groupId/report", async (req, res) => {
+  try {
+    const { groupId } = req.params;
+
+    const master = await pool.query(
+      `SELECT id, content, summary, metadata, total_chunks, created_at
+       FROM thoughts
+       WHERE group_id = $1 AND thought_type = 'intel_master'
+         AND deleted_at IS NULL`,
+      [groupId],
+    );
+
+    if (master.rows.length === 0) {
+      return res.status(404).json({ error: "Intel session not found" });
+    }
+
+    const row = master.rows[0];
+    const session = row.metadata?.session || {};
+
+    const chunks = await pool.query(
+      `SELECT chunk_index, content
+       FROM thoughts
+       WHERE group_id = $1 AND thought_type = 'intel_chunk'
+         AND deleted_at IS NULL
+       ORDER BY chunk_index`,
+      [groupId],
+    );
+
+    // Build chunk map: chunk_index → content
+    const chunkMap = {};
+    for (const c of chunks.rows) {
+      chunkMap[c.chunk_index] = c.content;
+    }
+
+    // Enrich nuggets with source text from chunk map
+    const rawNuggets = row.metadata?.gold_nuggets || [];
+    const nuggets = rawNuggets.map((n) => ({
+      insight: n.insight || null,
+      category: n.category || null,
+      actionable: n.actionable ?? false,
+      source_chunk: n.source_chunk ?? null,
+      source_similarity: n.source_similarity ?? null,
+      source_text: n.source_chunk != null ? chunkMap[n.source_chunk] || null : null,
+    }));
+
+    res.json({
+      title: session.title || "Untitled",
+      speaker: session.speaker || null,
+      conference: session.conference || null,
+      summary: row.summary,
+      nuggets,
+      topics: row.metadata?.topics || [],
+      action_items: row.metadata?.action_items || [],
+      total_chunks: row.total_chunks,
+      created_at: row.created_at,
+    });
+  } catch (error) {
+    console.error("Session report error:", error);
     res.status(500).json({ error: error.message });
   }
 });
